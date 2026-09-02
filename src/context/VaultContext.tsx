@@ -192,11 +192,22 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
         // key is parsed/unlocked before the per-item loop starts. This prevents
         // every item from paying the parse cost and avoids a race where multiple
         // concurrent decrypt calls would each re-parse the key.
+        //
+        // CRITICAL: If the key is incompatible with openpgp v6 (e.g. generated
+        // by an older version), readPrivateKey throws "Invalid enum value".
+        // We detect this early and skip the entire decryption pass so the app
+        // still renders the items (with masked passwords) instead of crashing
+        // to a black screen.
+        let keyParseFailed = false;
         if (activeKey) {
           try {
             await getUnlockedPrivateKey(activeKey, activePass || undefined);
           } catch (err: any) {
             console.warn('[Vault] pre-warm key cache failed:', err?.message || err);
+            if (String(err?.message || '').includes('Invalid enum value')) {
+              console.warn('[Vault] private key is incompatible with openpgp v6 — skipping decryption pass');
+              keyParseFailed = true;
+            }
           }
         }
 
@@ -204,76 +215,96 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
         const decryptedItems: VaultItem[] = [];
         let decryptedCount = 0;
 
-        const decryptOne = async (item: VaultItem) => {
-          if (
-            item.decryptedPassword &&
-            typeof item.decryptedPassword === 'string' &&
-            !isEncryptedCipher(item.decryptedPassword)
-          ) {
-            decryptedCount++;
-            return item;
-          }
+        const decryptOne = async (item: VaultItem): Promise<VaultItem> => {
+          // Top-level safety net: if anything unexpected throws, return the
+          // original item so the UI still renders it with a masked password.
+          try {
+            if (
+              item.decryptedPassword &&
+              typeof item.decryptedPassword === 'string' &&
+              !isEncryptedCipher(item.decryptedPassword)
+            ) {
+              decryptedCount++;
+              return item;
+            }
 
-          const userSecret = resolveBestSecret(
-            item,
-            user?.id,
-            user?.role,
-            user?.email
-          );
-          const rawBlob = userSecret?.encryptedData;
+            // If the key parse failed, skip all PGP operations — just return
+            // the item as-is so the UI renders.
+            if (keyParseFailed) {
+              return item;
+            }
 
-          if (item.encryptedSymmetricKey && (activeKey || activePass)) {
-            try {
-              const symKey = await decryptWithPrivateKey(
-                item.encryptedSymmetricKey,
-                activeKey || undefined,
-                activePass || undefined
-              );
-              if (symKey && rawBlob) {
-                // The symmetric key is the *password* for the encrypted blob,
-                // not a PGP private key.
-                const dec = await decryptSecret(rawBlob, undefined, symKey);
+            const userSecret = resolveBestSecret(
+              item,
+              user?.id,
+              user?.role,
+              user?.email
+            );
+            const rawBlob = userSecret?.encryptedData;
+
+            if (item.encryptedSymmetricKey && (activeKey || activePass)) {
+              try {
+                const symKey = await decryptWithPrivateKey(
+                  item.encryptedSymmetricKey,
+                  activeKey || undefined,
+                  activePass || undefined
+                );
+                if (symKey && rawBlob) {
+                  // The symmetric key is the *password* for the encrypted blob,
+                  // not a PGP private key.
+                  const dec = await decryptSecret(rawBlob, undefined, symKey);
+                  if (dec && !isEncryptedCipher(dec)) {
+                    decryptedCount++;
+                    return item.itemType === 'note'
+                      ? { ...item, noteContent: dec }
+                      : { ...item, decryptedPassword: dec };
+                  }
+                }
+              } catch (err: any) {
+                console.warn(`[Vault] decryptOne symmetric-key branch failed for item ${item.id}:`, err?.message || err);
+              }
+            }
+
+            if (
+              rawBlob &&
+              typeof rawBlob === 'string' &&
+              (activeKey || activePass)
+            ) {
+              try {
+                const dec = await decryptSecret(
+                  rawBlob,
+                  activeKey || undefined,
+                  activePass || undefined
+                );
                 if (dec && !isEncryptedCipher(dec)) {
                   decryptedCount++;
                   return item.itemType === 'note'
                     ? { ...item, noteContent: dec }
                     : { ...item, decryptedPassword: dec };
                 }
+              } catch (err: any) {
+                console.warn(`[Vault] decryptOne direct-PGP branch failed for item ${item.id}:`, err?.message || err);
               }
-            } catch (err: any) {
-              console.warn(`[Vault] decryptOne symmetric-key branch failed for item ${item.id}:`, err?.message || err);
             }
-          }
 
-          if (
-            rawBlob &&
-            typeof rawBlob === 'string' &&
-            (activeKey || activePass)
-          ) {
-            try {
-              const dec = await decryptSecret(
-                rawBlob,
-                activeKey || undefined,
-                activePass || undefined
-              );
-              if (dec && !isEncryptedCipher(dec)) {
-                decryptedCount++;
-                return item.itemType === 'note'
-                  ? { ...item, noteContent: dec }
-                  : { ...item, decryptedPassword: dec };
-              }
-            } catch (err: any) {
-              console.warn(`[Vault] decryptOne direct-PGP branch failed for item ${item.id}:`, err?.message || err);
-            }
+            return item;
+          } catch (err: any) {
+            console.warn(`[Vault] decryptOne unexpected error for item ${item.id}:`, err?.message || err);
+            return item;
           }
-
-          return item;
         };
 
         for (let i = 0; i < toDecrypt.length; i += BATCH_SIZE) {
           const chunk = toDecrypt.slice(i, i + BATCH_SIZE);
-          const results = await Promise.all(chunk.map(decryptOne));
-          decryptedItems.push(...results);
+          // Use allSettled instead of all so one failed item doesn't abort
+          // the entire batch and leave decryptedItems incomplete (which
+          // caused the black screen).
+          const settled = await Promise.allSettled(chunk.map(decryptOne));
+          for (const result of settled) {
+            if (result.status === 'fulfilled') {
+              decryptedItems.push(result.value);
+            }
+          }
 
           // Yield to the React Native UI thread every batch so that taps/buttons
           // don't freeze during a large vault decryption pass.
@@ -282,14 +313,19 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
           }
         }
 
+        // ALWAYS set items, even if nothing was decrypted — this ensures the
+        // UI renders the item list (with masked passwords) instead of staying
+        // on a black screen.
         setItems(decryptedItems);
         await AsyncStorage.setItem(
           `clickrypt_cached_vault_${appMode}`,
           JSON.stringify(decryptedItems)
         );
-        console.log(`[Vault] decryption pass finished, count ${decryptedCount}`);
+        console.log(`[Vault] decryption pass finished, count ${decryptedCount}/${toDecrypt.length}`);
       } catch (e) {
         console.warn('[Vault] decryption failed', e);
+        // Last-resort fallback: set the original items so the UI renders
+        setItems(toDecrypt);
       }
     },
     [appMode, masterPassword, unlockedPgpKey, user]

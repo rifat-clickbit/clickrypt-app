@@ -548,7 +548,15 @@ export async function decryptSecret(
 
   if (trimmed.includes('-----BEGIN PGP MESSAGE-----')) {
     const openpgp = await getOpenpgp();
-    const message = await openpgp.readMessage({ armoredMessage: trimmed });
+    let message: any;
+    try {
+      message = await openpgp.readMessage({ armoredMessage: trimmed });
+    } catch (err: any) {
+      // "Invalid enum value" or other parse errors mean the message is
+      // malformed or uses algorithms not supported by this openpgp version.
+      console.warn('[Crypto] decryptSecret: failed to parse PGP message:', err?.message || err);
+      return '';
+    }
 
     // 1. If privateKeyArmored is provided (either already unlocked or protected)
     if (privateKeyArmored && privateKeyArmored.includes('-----BEGIN PGP PRIVATE KEY')) {

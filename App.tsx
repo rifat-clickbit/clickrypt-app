@@ -32,14 +32,25 @@ import { initScreenProtection } from './src/services/screenProtection';
 import { requestNotificationPermissions } from './src/services/notificationService';
 
 const MainNavigator = () => {
-  const { isAuthenticated, isLoading, unlockWithBiometrics, unlockVault, appMode } = useAuth();
-  const { activeTab, setActiveTab } = useVault();
+  const { isAuthenticated, isLoading, unlockWithBiometrics, unlockVault, appMode, startupState, credentialsResolved } = useAuth();
+  const { activeTab, setActiveTab, isSyncing } = useVault();
   const { colors } = useTheme();
   const [isVaultLocked, setIsVaultLocked] = useState(false);
   const [passwordInput, setPasswordInput] = useState('');
   const [unlockError, setUnlockError] = useState<string | null>(null);
   const [isUnlocking, setIsUnlocking] = useState(false);
   const backgroundTimeRef = useRef<number | null>(null);
+
+  // === TEMPORARY DEBUG OVERLAY ===
+  // Shows the startup state on-screen so we can diagnose freezes without
+  // needing Metro terminal logs. Remove after debugging is complete.
+  const [debugTick, setDebugTick] = useState(0);
+  useEffect(() => {
+    const interval = setInterval(() => setDebugTick((t) => t + 1), 500);
+    return () => clearInterval(interval);
+  }, []);
+  const debugText = `startup=${startupState} auth=${isAuthenticated} loading=${isLoading} creds=${credentialsResolved} syncing=${isSyncing} tab=${activeTab} tick=${debugTick}`;
+  // === END DEBUG OVERLAY ===
 
   // If switched to personal mode while on team tab, switch to passwords
   useEffect(() => {
@@ -107,12 +118,22 @@ const MainNavigator = () => {
     return (
       <View style={[styles.screenWrapper, { backgroundColor: colors.bg, alignItems: 'center', justifyContent: 'center' }]}>
         <ActivityIndicator size="large" color={colors.cyan} />
+        <Text style={{ position: 'absolute', bottom: 40, left: 10, right: 10, fontSize: 10, color: colors.textMuted, textAlign: 'center' }}>
+          [DEBUG] {debugText}
+        </Text>
       </View>
     );
   }
 
   if (!isAuthenticated) {
-    return <AuthScreen />;
+    return (
+      <View style={{ flex: 1 }}>
+        <AuthScreen />
+        <Text style={{ position: 'absolute', bottom: 5, left: 10, right: 10, fontSize: 9, color: '#888', textAlign: 'center' }}>
+          [DEBUG] {debugText}
+        </Text>
+      </View>
+    );
   }
 
   if (isVaultLocked) {
@@ -194,6 +215,9 @@ const MainNavigator = () => {
         {activeTab === 'settings' && <SettingsScreen />}
       </View>
       <BottomNav currentTab={activeTab} onTabChange={setActiveTab} appMode={appMode} />
+      <Text style={{ position: 'absolute', bottom: 60, left: 10, right: 10, fontSize: 9, color: '#888', textAlign: 'center' }}>
+        [DEBUG] {debugText}
+      </Text>
     </View>
   );
 };
