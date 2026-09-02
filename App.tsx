@@ -41,11 +41,6 @@ const MainNavigator = () => {
   const [isUnlocking, setIsUnlocking] = useState(false);
   const backgroundTimeRef = useRef<number | null>(null);
 
-  // === TEMPORARY DEBUG OVERLAY ===
-  // Static debug text (no interval re-renders that could interfere with touch).
-  const debugText = `startup=${startupState} auth=${isAuthenticated} loading=${isLoading} creds=${credentialsResolved} syncing=${isSyncing} tab=${activeTab} items=${items.length}`;
-  // === END DEBUG OVERLAY ===
-
   // If switched to personal mode while on team tab, switch to passwords
   useEffect(() => {
     if (appMode === 'personal' && activeTab === 'team') {
@@ -112,9 +107,6 @@ const MainNavigator = () => {
     return (
       <View style={[styles.screenWrapper, { backgroundColor: colors.bg, alignItems: 'center', justifyContent: 'center' }]}>
         <ActivityIndicator size="large" color={colors.cyan} />
-        <Text style={{ position: 'absolute', bottom: 40, left: 10, right: 10, fontSize: 10, color: colors.textMuted, textAlign: 'center' }}>
-          [DEBUG] {debugText}
-        </Text>
       </View>
     );
   }
@@ -123,9 +115,6 @@ const MainNavigator = () => {
     return (
       <View style={{ flex: 1 }}>
         <AuthScreen />
-        <Text style={{ position: 'absolute', bottom: 5, left: 10, right: 10, fontSize: 9, color: '#888', textAlign: 'center' }}>
-          [DEBUG] {debugText}
-        </Text>
       </View>
     );
   }
@@ -209,9 +198,6 @@ const MainNavigator = () => {
         {activeTab === 'settings' && <SettingsScreen />}
       </View>
       <BottomNav currentTab={activeTab} onTabChange={setActiveTab} appMode={appMode} />
-      <Text style={{ position: 'absolute', bottom: 60, left: 10, right: 10, fontSize: 9, color: '#888', textAlign: 'center' }}>
-        [DEBUG] {debugText}
-      </Text>
     </View>
   );
 };

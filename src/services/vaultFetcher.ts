@@ -31,7 +31,7 @@ const normalizeData = (raw: any): any => {
 const buildOwnerFilter = (userIds: string[]): string => {
   return userIds
     .filter(Boolean)
-    .flatMap((id) => [`owner_id.eq.${id}`, `data->>ownerId.eq.${id}`])
+    .map((id) => `owner_id.eq.${id}`)
     .join(',');
 };
 
@@ -49,6 +49,8 @@ export const fetchVaultDirect = async (
     const userIds = [user.id, user.authId].filter(
       (id): id is string => !!id
     ) as string[];
+
+    if (userIds.length === 0) return null;
 
     const ownerFilter = buildOwnerFilter(userIds);
 
@@ -80,21 +82,26 @@ export const fetchVaultDirect = async (
     }
 
     const [folderRes, resourceRes] = await Promise.all([
-      supabase.from('folders').select('*').eq('mode', appMode).or(ownerFilter),
+      supabase.from('folders').select('*').eq('mode', appMode).or(ownerFilter).then(
+        (res) => res,
+        (err) => ({ data: [], error: err })
+      ),
       supabase
         .from('resources')
         .select('*')
         .eq('mode', appMode)
-        .or(resourceOrParts.join(',')),
+        .or(resourceOrParts.join(',')).then(
+          (res) => res,
+          (err) => ({ data: null, error: err })
+        ),
     ]);
 
     if (folderRes.error) {
-      console.warn('[vaultFetcher] folders error', folderRes.error);
+      console.warn('[vaultFetcher] folders notice', folderRes.error);
     }
     if (resourceRes.error) {
-      console.warn('[vaultFetcher] resources error', resourceRes.error);
-      // If we cannot read resources at all, signal failure so caller can use cache.
-      if (resourceRes.error) return null;
+      console.warn('[vaultFetcher] resources notice', resourceRes.error);
+      if (!resourceRes.data) return null;
     }
 
     const folderRows = (folderRes.data as any[]) || [];

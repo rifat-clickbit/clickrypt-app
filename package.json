@@ -8,9 +8,11 @@
     "start:tunnel": "cross-env REACT_NATIVE_PACKAGER_HOSTNAME=10.10.0.106 expo start --tunnel",
     "android": "expo start --android",
     "ios": "expo start --ios",
+    "web": "expo start --web",
     "postinstall": "patch-package"
   },
   "dependencies": {
+    "@expo/metro-runtime": "~6.1.2",
     "@noble/ciphers": "^2.4.0",
     "@noble/hashes": "^2.4.0",
     "@react-native-async-storage/async-storage": "2.2.0",
@@ -31,11 +33,13 @@
     "lucide-react-native": "^1.34.0",
     "openpgp": "^5.11.2",
     "react": "19.1.0",
+    "react-dom": "19.1.0",
     "react-native": "0.81.5",
     "react-native-get-random-values": "~1.11.0",
     "react-native-qrcode-svg": "^6.3.21",
     "react-native-safe-area-context": "~5.6.0",
-    "react-native-svg": "15.12.1"
+    "react-native-svg": "15.12.1",
+    "react-native-web": "^0.21.0"
   },
   "devDependencies": {
     "@babel/core": "^7.20.0",

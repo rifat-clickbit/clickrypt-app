@@ -1,3 +1,4 @@
+import { Platform } from 'react-native';
 import * as Notifications from 'expo-notifications';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Constants, { ExecutionEnvironment } from 'expo-constants';
@@ -6,7 +7,7 @@ const isExpoGo = Constants.executionEnvironment === ExecutionEnvironment.StoreCl
 
 // Configure foreground notification presentation safely
 try {
-  if (!isExpoGo) {
+  if (!isExpoGo && Platform.OS !== 'web') {
     Notifications.setNotificationHandler({
       handleNotification: async () => ({
         shouldShowAlert: true,
@@ -24,7 +25,7 @@ try {
 const NOTIFICATIONS_ENABLED_KEY = 'clickrypt_push_notifications_enabled';
 
 export async function requestNotificationPermissions(): Promise<boolean> {
-  if (isExpoGo) return false;
+  if (isExpoGo || Platform.OS === 'web') return false;
   try {
     const { status: existingStatus } = await Notifications.getPermissionsAsync();
     let finalStatus = existingStatus;

@@ -126,13 +126,14 @@ export const logActivity = async (
   };
 
   try {
-    const current = await getActivityLogs(userId, email);
+    const raw = await AsyncStorage.getItem(key);
+    const current: ActivityLogItem[] = raw ? JSON.parse(raw) : [];
     const updated = [newItem, ...current].slice(0, 100);
     await AsyncStorage.setItem(key, JSON.stringify(updated));
 
-    // Save to Supabase activity_logs table
+    // Background sync to Supabase activity_logs table
     if (userId) {
-      await withTimeout(
+      Promise.resolve(
         supabase.from('activity_logs').insert({
           id: newItem.id,
           user_id: userId,
@@ -142,16 +143,7 @@ export const logActivity = async (
           category,
           mode,
           timestamp: newItem.timestamp,
-        }),
-        10000,
-        'logActivity insert'
-      ).catch(() => {});
-      // Invalidate the Redis cache so the next read is fresh
-      await withTimeout(
-        supabase.functions
-          .invoke('activity-log-cache-invalidate', { body: {} }),
-        10000,
-        'logActivity cache-invalidate'
+        })
       ).catch(() => {});
     }
   } catch {

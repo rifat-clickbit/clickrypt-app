@@ -168,172 +168,20 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
     ).catch(() => {});
   }, [user, appMode]);
 
-  const decryptRawItems = useCallback(
-    async (toDecrypt: VaultItem[], fromCache = false) => {
-      try {
-        const activePass =
-          masterPassword ||
-          (await AsyncStorage.getItem('clickrypt_master_password'));
-
-        // Prefer the already-unlocked private key. If it is not in state/storage,
-        // fall back to the encrypted private key in the user record so we can try
-        // to unlock it with the master password.
-        let activeKey =
-          unlockedPgpKey ||
-          (await AsyncStorage.getItem('clickrypt_unlocked_pgp_key'));
-        if (!activeKey && user?.encryptedPrivateKey) {
-          activeKey = user.encryptedPrivateKey;
-        }
-
-        const hasKey = isDecryptionKeyAvailable(activeKey, activePass, user?.encryptedPrivateKey);
-        console.log(`[Vault] decryptRawItems: hasKey=${hasKey}, activeKey=${!!activeKey}, activePass=${!!activePass}, userEncryptedPrivateKey=${!!user?.encryptedPrivateKey}`);
-
-        // Pre-warm the private-key cache once so the PGP module is loaded and the
-        // key is parsed/unlocked before the per-item loop starts. This prevents
-        // every item from paying the parse cost and avoids a race where multiple
-        // concurrent decrypt calls would each re-parse the key.
-        //
-        // CRITICAL: If the key is incompatible with openpgp v6 (e.g. generated
-        // by an older version), readPrivateKey throws "Invalid enum value".
-        // We detect this early and skip the entire decryption pass so the app
-        // still renders the items (with masked passwords) instead of crashing
-        // to a black screen.
-        let keyParseFailed = false;
-        if (activeKey) {
-          try {
-            await getUnlockedPrivateKey(activeKey, activePass || undefined);
-          } catch (err: any) {
-            console.warn('[Vault] pre-warm key cache failed:', err?.message || err);
-            if (String(err?.message || '').includes('Invalid enum value')) {
-              console.warn('[Vault] private key is incompatible with openpgp v6 — skipping decryption pass');
-              keyParseFailed = true;
-            }
-          }
-        }
-
-        // Process items one at a time (BATCH_SIZE=1) instead of 5 at a time.
-        // PGP operations are CPU-intensive and run on the JS thread in RN;
-        // processing 5 concurrently blocks touch events for too long.
-        const BATCH_SIZE = 1;
-        const decryptedItems: VaultItem[] = [];
-        let decryptedCount = 0;
-
-        const decryptOne = async (item: VaultItem): Promise<VaultItem> => {
-          // Top-level safety net: if anything unexpected throws, return the
-          // original item so the UI still renders it with a masked password.
-          try {
-            if (
-              item.decryptedPassword &&
-              typeof item.decryptedPassword === 'string' &&
-              !isEncryptedCipher(item.decryptedPassword)
-            ) {
-              decryptedCount++;
-              return item;
-            }
-
-            // If the key parse failed, skip all PGP operations — just return
-            // the item as-is so the UI renders.
-            if (keyParseFailed) {
-              return item;
-            }
-
-            const userSecret = resolveBestSecret(
-              item,
-              user?.id,
-              user?.role,
-              user?.email
-            );
-            const rawBlob = userSecret?.encryptedData;
-
-            if (item.encryptedSymmetricKey && (activeKey || activePass)) {
-              try {
-                const symKey = await decryptWithPrivateKey(
-                  item.encryptedSymmetricKey,
-                  activeKey || undefined,
-                  activePass || undefined
-                );
-                if (symKey && rawBlob) {
-                  // The symmetric key is the *password* for the encrypted blob,
-                  // not a PGP private key.
-                  const dec = await decryptSecret(rawBlob, undefined, symKey);
-                  if (dec && !isEncryptedCipher(dec)) {
-                    decryptedCount++;
-                    return item.itemType === 'note'
-                      ? { ...item, noteContent: dec }
-                      : { ...item, decryptedPassword: dec };
-                  }
-                }
-              } catch (err: any) {
-                console.warn(`[Vault] decryptOne symmetric-key branch failed for item ${item.id}:`, err?.message || err);
-              }
-            }
-
-            if (
-              rawBlob &&
-              typeof rawBlob === 'string' &&
-              (activeKey || activePass)
-            ) {
-              try {
-                const dec = await decryptSecret(
-                  rawBlob,
-                  activeKey || undefined,
-                  activePass || undefined
-                );
-                if (dec && !isEncryptedCipher(dec)) {
-                  decryptedCount++;
-                  return item.itemType === 'note'
-                    ? { ...item, noteContent: dec }
-                    : { ...item, decryptedPassword: dec };
-                }
-              } catch (err: any) {
-                console.warn(`[Vault] decryptOne direct-PGP branch failed for item ${item.id}:`, err?.message || err);
-              }
-            }
-
-            return item;
-          } catch (err: any) {
-            console.warn(`[Vault] decryptOne unexpected error for item ${item.id}:`, err?.message || err);
-            return item;
-          }
-        };
-
-        for (let i = 0; i < toDecrypt.length; i += BATCH_SIZE) {
-          const chunk = toDecrypt.slice(i, i + BATCH_SIZE);
-          // Use allSettled instead of all so one failed item doesn't abort
-          // the entire batch and leave decryptedItems incomplete (which
-          // caused the black screen).
-          const settled = await Promise.allSettled(chunk.map(decryptOne));
-          for (const result of settled) {
-            if (result.status === 'fulfilled') {
-              decryptedItems.push(result.value);
-            }
-          }
-
-          // Yield to the React Native UI thread every batch so that taps/buttons
-          // don't freeze during a large vault decryption pass. 50ms gives the
-          // native touch handler enough time to process queued gestures.
-          if (i + BATCH_SIZE < toDecrypt.length) {
-            await new Promise<void>((r) => setTimeout(r, 50));
-          }
-        }
-
-        // ALWAYS set items, even if nothing was decrypted — this ensures the
-        // UI renders the item list (with masked passwords) instead of staying
-        // on a black screen.
-        setItems(decryptedItems);
-        await AsyncStorage.setItem(
-          `clickrypt_cached_vault_${appMode}`,
-          JSON.stringify(decryptedItems)
-        );
-        console.log(`[Vault] decryption pass finished, count ${decryptedCount}/${toDecrypt.length}`);
-      } catch (e) {
-        console.warn('[Vault] decryption failed', e);
-        // Last-resort fallback: set the original items so the UI renders
-        setItems(toDecrypt);
+  // Load cached items immediately for instant UI availability
+  useEffect(() => {
+    let isMounted = true;
+    (async () => {
+      const cached = await loadCachedVault(appMode);
+      if (isMounted && cached.length > 0) {
+        setItems(cached);
+        setRawItems(cached);
       }
-    },
-    [appMode, masterPassword, unlockedPgpKey, user]
-  );
+    })();
+    return () => {
+      isMounted = false;
+    };
+  }, [appMode]);
 
   const fetchVaultData = useCallback(
     async (showLoading: boolean) => {
@@ -348,114 +196,118 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
       if (showLoading) setIsLoading(true);
       setIsSyncing(true);
 
-      let shouldRecurse = false;
-
       try {
         const currentUser = userRef.current;
-        if (!currentUser) {
-          const cached = await withTimeout(
-            loadCachedVault(appMode),
-            5000,
-            'fetchVaultData loadCachedVault (no user)'
-          ).catch(() => [] as VaultItem[]);
+        if (!currentUser?.id) {
+          const cached = await loadCachedVault(appMode);
           setItems(cached);
           setRawItems(cached);
           return;
         }
 
-        const { data, error } = await withTimeout(
-          supabase.functions.invoke('vault-cache', {
-            body: { appMode },
-          }),
-          15000,
-          'vault-cache'
-        );
+        let fetchedItems: VaultItem[] | null = null;
+        let fetchedFolders: FolderItem[] | null = null;
 
-        if (error || !data) {
-          throw error || new Error('empty vault-cache response');
+        // 1. Try edge function cache first
+        try {
+          const { data, error } = await withTimeout(
+            supabase.functions.invoke('vault-cache', {
+              body: { appMode },
+            }),
+            12000,
+            'vault-cache'
+          );
+
+          if (!error && data?.items) {
+            fetchedItems = data.items || [];
+            fetchedFolders = data.folders || [];
+          }
+        } catch (edgeErr) {
+          console.warn(`[Vault] vault-cache edge function notice for ${currentUser.id}:`, edgeErr);
         }
 
-        setFolders(data.folders || []);
-        setRawItems(data.items || []);
-        // Decryption is handled by the dedicated effect below once credentials
-        // are resolved, so we don't duplicate work here.
-      } catch (e) {
-        console.warn(`[Vault] edge function failed for ${userRef.current?.id}, mode ${appMode}`, e);
-
-        // Fallback: query Supabase directly so the app still works when the
-        // edge function is broken or unreachable.
-        try {
-          const currentUser = userRef.current;
-          if (currentUser) {
+        // 2. Direct Supabase fallback query if edge function missed or failed
+        if (!fetchedItems) {
+          try {
             const direct = await withTimeout(
               fetchVaultDirect(supabase, currentUser, appMode),
-              15000,
+              12000,
               'vault-fetch-direct'
             );
             if (direct && direct.items) {
-              console.log(`[Vault] direct fallback returned ${direct.items.length} items, ${direct.folders.length} folders`);
-              setFolders(direct.folders || []);
-              setRawItems(direct.items || []);
-              return;
+              fetchedItems = direct.items;
+              fetchedFolders = direct.folders;
             }
+          } catch (directErr) {
+            console.warn('[Vault] direct fallback notice:', directErr);
           }
-        } catch (directErr) {
-          console.warn('[Vault] direct fallback failed', directErr);
         }
 
-        const cached = await withTimeout(
-          loadCachedVault(appMode),
-          5000,
-          'fetchVaultData loadCachedVault (fallback)'
-        ).catch(() => [] as VaultItem[]);
-        setItems(cached);
-        setRawItems(cached);
+        if (fetchedItems) {
+          setFolders(fetchedFolders || []);
+          setRawItems(fetchedItems);
+          // Preserve any in-memory decrypted passwords so background sync does not clear revealed items
+          setItems((prevItems) => {
+            const revealedMap = new Map(
+              prevItems
+                .filter((i) => i.decryptedPassword && !isEncryptedCipher(i.decryptedPassword))
+                .map((i) => [i.id, i.decryptedPassword])
+            );
+            return fetchedItems.map((item) => {
+              const cachedPass = revealedMap.get(item.id);
+              return cachedPass ? { ...item, decryptedPassword: cachedPass } : item;
+            });
+          });
+          await AsyncStorage.setItem(
+            `clickrypt_cached_vault_${appMode}`,
+            JSON.stringify(fetchedItems)
+          );
+        } else {
+          // 3. Fall back to local AsyncStorage cache
+          const cached = await loadCachedVault(appMode);
+          if (cached.length > 0) {
+            setItems(cached);
+            setRawItems(cached);
+          }
+        }
+      } catch (err) {
+        console.warn('[Vault] fetchVaultData error:', err);
       } finally {
         isFetchingRef.current = false;
         setIsLoading(false);
         setIsSyncing(false);
-        shouldRecurse = pendingFetchRef.current;
-        if (shouldRecurse) {
+
+        if (pendingFetchRef.current) {
           pendingFetchRef.current = false;
+          // Run one debounced follow-up fetch if mutations arrived during sync
+          setTimeout(() => {
+            if (userRef.current?.id) {
+              fetchVaultData(false);
+            }
+          }, 1000);
         }
       }
-
-      if (shouldRecurse) {
-        await fetchVaultData(false);
-      }
     },
-    [appMode] // userRef.current is read at call-time; no need to key on user object
+    [appMode]
   );
-
-  // Load cached items immediately for instant UI availability
-  useEffect(() => {
-    (async () => {
-      const cached = await loadCachedVault(appMode);
-      if (cached.length > 0) {
-        setItems(cached);
-        setRawItems(cached);
-      }
-    })();
-  }, [appMode]);
 
   // Network sync, realtime subscriptions, and offline auto-sync
   useEffect(() => {
-    const syncKey = `${appMode}-${user?.id || 'anon'}`;
+    const currentUserId = user?.id;
+    const syncKey = `${appMode}-${currentUserId || 'anon'}`;
 
-    // Load from cache when there is no logged-in user
-    if (!user?.id) {
+    if (!currentUserId) {
       loadCachedVault(appMode).then((cached) => {
         if (cached.length > 0) {
           setItems(cached);
           setRawItems(cached);
         }
       });
+      return;
     }
 
-    // Do the initial network sync only once per (appMode, user) combination.
-    // The previous implementation re-fetched every time `items`/`rawItems`
-    // changed, which created an infinite re-render/re-subscription loop.
-    if (user?.id && initialSyncRef.current !== syncKey) {
+    // Initial sync for this user and appMode
+    if (initialSyncRef.current !== syncKey) {
       initialSyncRef.current = syncKey;
       fetchVaultData(true);
     }
@@ -464,7 +316,7 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
     const debouncedFetch = () => {
       if (syncTimeout) clearTimeout(syncTimeout);
       syncTimeout = setTimeout(() => {
-        if (user?.id) {
+        if (userRef.current?.id) {
           fetchVaultData(false);
         }
       }, 1500);
@@ -472,7 +324,7 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
 
     const unsubscribeNet = setupOfflineAutoSync(debouncedFetch);
 
-    // Subscribe to realtime updates only once per (appMode, user).
+    // Prevent duplicate channel subscriptions
     if (subscribedRef.current === syncKey) {
       return () => {
         if (syncTimeout) clearTimeout(syncTimeout);
@@ -482,23 +334,19 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
     subscribedRef.current = syncKey;
 
     const channelName = `vault_sync_${syncKey}_${Date.now()}`;
-    // Filter realtime events to only rows this user owns or is a recipient of.
-    // Without filters, ANY user's write to these tables triggers a resync,
-    // which keeps the app perpetually in "syncing..." state.
-    const userIds = [user?.id, user?.authId].filter(Boolean) as string[];
-    const ownerIdFilter = `owner_id=in.(${userIds.join(',')})`;
-    const recipientFilter = `recipient_id=in.(${userIds.join(',')})`;
+    const ownerFilter = `owner_id=eq.${currentUserId}`;
+    const recipientFilter = `recipient_id=eq.${currentUserId}`;
 
     const channel = supabase
       .channel(channelName)
       .on(
         'postgres_changes',
-        { event: '*', schema: 'public', table: 'resources', filter: ownerIdFilter },
+        { event: '*', schema: 'public', table: 'resources', filter: ownerFilter },
         debouncedFetch
       )
       .on(
         'postgres_changes',
-        { event: '*', schema: 'public', table: 'folders', filter: ownerIdFilter },
+        { event: '*', schema: 'public', table: 'folders', filter: ownerFilter },
         debouncedFetch
       )
       .on(
@@ -516,22 +364,10 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
       } catch {
         // ignore
       }
-      // Allow re-subscription when the user or appMode actually changes
       subscribedRef.current = null;
       initialSyncRef.current = null;
     };
   }, [appMode, fetchVaultData, user?.id]);
-
-  // Decrypt raw items once credentials are resolved
-  useEffect(() => {
-    if (credentialsResolved && rawItems.length > 0) {
-      const rawKey = rawItems.map((i) => i.id).join(',');
-      if (rawKey !== lastRawKeyRef.current) {
-        lastRawKeyRef.current = rawKey;
-        decryptRawItems(rawItems, true);
-      }
-    }
-  }, [credentialsResolved, rawItems, decryptRawItems]);
 
   const createItem = useCallback(
     async (payload: {
@@ -1134,10 +970,11 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
       }
 
       const commitDecrypted = async (val: string) => {
-        const next = items.map((i) =>
-          i.id === item.id ? { ...i, decryptedPassword: val } : i
+        setItems((prev) =>
+          prev.map((i) =>
+            i.id === item.id ? { ...i, decryptedPassword: val } : i
+          )
         );
-        setItems(next);
         logActivity(
           user.id,
           user.email,
@@ -1170,9 +1007,6 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
         console.warn('[Vault] revealPassword: no decryption key available for item', item.id);
         throw new VaultLockedError();
       }
-
-      const userSecretPreview = resolveBestSecret(item, user.id, user.role, user.email);
-      console.log(`[Vault] revealPassword start: item=${item.id}, hasEncryptedSymmetricKey=${!!item.encryptedSymmetricKey}, hasRawBlob=${!!userSecretPreview?.encryptedData}, activeKey=${!!activeKey}, activePass=${!!activePass}`);
 
       const userSecret = resolveBestSecret(
         item,
@@ -1218,10 +1052,8 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
               decrypted !== '•••••••' &&
               decrypted !== '••••••••'
             ) {
-              console.log(`[Vault] revealPassword symmetric branch succeeded for item ${item.id}`);
               return await commitDecrypted(decrypted);
             }
-            console.warn(`[Vault] revealPassword symmetric branch returned undecryptable result for item ${item.id}`);
           }
         } catch (err: any) {
           console.warn(`[Vault] revealPassword symmetric branch failed for item ${item.id}:`, err?.message || err);
@@ -1236,7 +1068,7 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
             .eq('resource_id', item.id)
             .eq('recipient_id', user.id)
             .maybeSingle(),
-          10000,
+          6000,
           'revealPassword resource_shares lookup'
         );
 
@@ -1257,10 +1089,8 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
             decrypted !== '•••••••' &&
             decrypted !== '••••••••'
           ) {
-            console.log(`[Vault] revealPassword resource_share branch succeeded for item ${item.id}`);
             return await commitDecrypted(decrypted);
           }
-          console.warn(`[Vault] revealPassword resource_share branch returned undecryptable result for item ${item.id}`);
         }
       } catch (err: any) {
         console.warn(`[Vault] revealPassword resource_share branch failed for item ${item.id}:`, err?.message || err);
@@ -1281,10 +1111,8 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
             decrypted !== '•••••••' &&
             decrypted !== '••••••••'
           ) {
-            console.log(`[Vault] revealPassword direct-PGP branch succeeded for item ${item.id}`);
             return await commitDecrypted(decrypted);
           }
-          console.warn(`[Vault] revealPassword direct-PGP branch returned undecryptable result for item ${item.id}`);
         } catch (err: any) {
           console.warn(`[Vault] revealPassword direct-PGP branch failed for item ${item.id}:`, err?.message || err);
         }
@@ -1298,9 +1126,7 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
         return item.decryptedPassword;
       }
 
-      // Legacy plaintext recovery: check all possible fields where plaintext
-      // may have been stored by older versions of the app (before the
-      // persistableItem fix stripped password/noteContent from the DB payload).
+      // Legacy plaintext recovery
       const fallbackVal: any =
         (item as any).password ||
         (item as any).data?.password ||
@@ -1313,63 +1139,7 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
 
       if (fallbackVal && typeof fallbackVal === 'string' && !isEncryptedCipher(fallbackVal) &&
           fallbackVal !== '•••••••' && fallbackVal !== '••••••••') {
-        console.log(`[Vault] revealPassword fallback branch succeeded for item ${item.id}`);
-        const result = await commitDecrypted(fallbackVal);
-
-        // Auto-re-encrypt: migrate the recovered plaintext to the proper
-        // symmetric+PGP scheme so future reveals use the normal path and the
-        // item is no longer dependent on the legacy plaintext fallback.
-        if (user.publicKey && (activeKey || activePass)) {
-          try {
-            const itemSymmetricKey = generateSymmetricKey();
-            const newBlob = await encryptSecret(fallbackVal, itemSymmetricKey);
-            const newWrappedKey = await encryptWithPublicKey(
-              itemSymmetricKey,
-              user.publicKey
-            );
-            if (newBlob && newWrappedKey &&
-                newBlob.includes('-----BEGIN PGP MESSAGE-----') &&
-                newWrappedKey.includes('-----BEGIN PGP MESSAGE-----')) {
-              const updated = items.map((i) =>
-                i.id === item.id
-                  ? {
-                      ...i,
-                      secrets: [{ userId: user.id, encryptedData: newBlob }],
-                      encryptedSymmetricKey: newWrappedKey,
-                      decryptedPassword: fallbackVal,
-                    }
-                  : i
-              );
-              setItems(updated);
-              await AsyncStorage.setItem(
-                `clickrypt_cached_vault_${appMode}`,
-                JSON.stringify(updated)
-              );
-              try {
-                await withTimeout(
-                  supabase.from('resources').upsert({
-                    id: item.id,
-                    mode: appMode,
-                    owner_id: item.ownerId || user.id,
-                    folder_id: item.folderId ?? null,
-                    data: persistableItem(
-                      updated.find((i) => i.id === item.id) as VaultItem
-                    ),
-                  }),
-                  15000,
-                  'revealPassword auto-re-encrypt upsert'
-                );
-                console.log(`[Vault] revealPassword: auto-re-encrypted item ${item.id} migrated to proper scheme`);
-              } catch (err: any) {
-                console.warn(`[Vault] revealPassword: auto-re-encrypt DB persist failed for item ${item.id}:`, err?.message || err);
-              }
-            }
-          } catch (err: any) {
-            console.warn(`[Vault] revealPassword: auto-re-encrypt failed for item ${item.id}:`, err?.message || err);
-          }
-        }
-
-        return result;
+        return await commitDecrypted(fallbackVal);
       }
 
       console.warn(`[Vault] revealPassword: all branches exhausted for item ${item.id}`);
@@ -1377,7 +1147,7 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
         'Unable to decrypt this item. The stored secret may be damaged or the encryption key does not match.'
       );
     },
-    [appMode, items, masterPassword, unlockedPgpKey, user]
+    [appMode, masterPassword, unlockedPgpKey, user]
   );
 
   const shareItemWithMember = useCallback(

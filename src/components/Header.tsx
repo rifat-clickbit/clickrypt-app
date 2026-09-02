@@ -88,7 +88,7 @@ export const Header: React.FC<HeaderProps> = ({
     return () => {
       unsubscribe();
     };
-  }, [user?.id, user?.email, items.length]);
+  }, [user?.id, user?.email]);
 
   const userInitials = user?.name
     ? user.name

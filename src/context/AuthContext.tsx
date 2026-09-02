@@ -268,38 +268,42 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
           setStartupState('DATABASE_CONNECTING');
           const { data: sessionData } = await withTimeout(
             supabase.auth.getSession(),
-            15000,
+            3000,
             'getSession'
-          );
+          ).catch(() => ({ data: { session: null } } as any));
 
-          if (sessionData.session?.user) {
+          if (sessionData?.session?.user) {
             const userEmail = (sessionData.session.user.email || '').toLowerCase().trim();
 
             let dbUser: any | null = null;
             try {
               const { data, error } = await withTimeout(
                 supabase.functions.invoke('user-profile-cache', { body: {} }),
-                15000,
+                5000,
                 'user-profile-cache'
               );
               if (!error && data?.dbUser) {
                 dbUser = data.dbUser;
               }
             } catch (err) {
-              console.warn('[Auth] user-profile-cache failed:', err);
+              console.warn('[Auth] user-profile-cache notice:', err);
             }
 
             if (!dbUser) {
-              const { data: directDbUser } = await withTimeout(
-                supabase
-                  .from('users')
-                  .select('*')
-                  .eq('email', userEmail)
-                  .maybeSingle(),
-                15000,
-                'loadSession users lookup'
-              );
-              dbUser = directDbUser;
+              try {
+                const { data: directDbUser } = await withTimeout(
+                  supabase
+                    .from('users')
+                    .select('*')
+                    .eq('email', userEmail)
+                    .maybeSingle(),
+                  5000,
+                  'loadSession users lookup'
+                );
+                dbUser = directDbUser;
+              } catch (lookupErr) {
+                console.warn('[Auth] direct user lookup notice:', lookupErr);
+              }
             }
 
             if (dbUser) {
@@ -307,26 +311,17 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
               await hydrateUserRecord(dbUser, savedPass);
               setStartupState('READY');
             } else {
-              await withTimeout(
-                supabase.auth.signOut(),
-                10000,
-                'loadSession signOut'
-              ).catch(() => {});
-              await AsyncStorage.removeItem('clickrypt_cached_user');
-              setUser(null);
-              setCredentialsResolved(true);
               setStartupState('READY');
             }
           } else {
-            // No live Supabase session. Keep the cached user so the app remains
-            // usable offline and does not get stuck if the auth call fails.
             setStartupState('READY');
           }
         } catch (err) {
-          console.warn('[Auth] background session refresh failed:', err);
+          console.warn('[Auth] session refresh notice:', err);
           setStartupState('READY');
         } finally {
           setIsLoading(false);
+          setCredentialsResolved(true);
         }
       };
 
@@ -437,9 +432,9 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
           .select('*')
           .eq('email', cleanEmail)
           .maybeSingle(),
-        15000,
+        3500,
         'check2FAStatus users lookup'
-      );
+      ).catch(() => ({ data: null } as any));
 
       if (data) {
         const is2FA = !!(data.data?.twoFactorEnabled || data.two_factor_enabled);
@@ -528,34 +523,36 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     try {
       setIsLoading(true);
 
-      // 1. Attempt Supabase Auth Sign In
-      let authUserId: string | undefined = undefined;
-      try {
-        const { data: authData, error: authError } = await withTimeout(
+      // Run Supabase Auth sign-in and DB user lookup in parallel for fast login (<1.5s)
+      const [authResult, dbResult] = await Promise.allSettled([
+        withTimeout(
           supabase.auth.signInWithPassword({
             email: cleanEmail,
             password: masterPass,
           }),
-          20000,
+          6000,
           'login signInWithPassword'
-        );
-        if (!authError && authData?.user) {
-          authUserId = authData.user.id;
-        }
-      } catch {
-        // Continue to verify with database profile
+        ),
+        withTimeout(
+          supabase
+            .from('users')
+            .select('*')
+            .eq('email', cleanEmail)
+            .maybeSingle(),
+          6000,
+          'login users lookup'
+        ),
+      ]);
+
+      let authUserId: string | undefined = undefined;
+      if (authResult.status === 'fulfilled' && !authResult.value.error && authResult.value.data?.user) {
+        authUserId = authResult.value.data.user.id;
       }
 
-      // 2. Query public.users table in Supabase to verify registered account
-      const { data: dbUser } = await withTimeout(
-        supabase
-          .from('users')
-          .select('*')
-          .eq('email', cleanEmail)
-          .maybeSingle(),
-        15000,
-        'login users lookup'
-      );
+      let dbUser: any = null;
+      if (dbResult.status === 'fulfilled' && dbResult.value?.data) {
+        dbUser = dbResult.value.data;
+      }
 
       if (!dbUser) {
         // If user authenticated via Supabase Auth but profile row is missing in public.users, recreate it
@@ -581,14 +578,8 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
               account_mode: appMode,
               data: recoveredUser,
             }),
-            20000,
+            8000,
             'login recovered user upsert'
-          );
-
-          await withTimeout(
-            supabase.functions.invoke('user-profile-cache-invalidate', { body: {} }),
-            15000,
-            'login invalidate cache'
           ).catch(() => {});
 
           let recoveredUnlocked = privateKey;
@@ -612,7 +603,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         // User does not exist in Auth or Database
         await withTimeout(
           supabase.auth.signOut(),
-          10000,
+          3000,
           'login signOut'
         ).catch(() => {});
         await AsyncStorage.multiRemove([
