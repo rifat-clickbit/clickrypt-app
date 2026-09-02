@@ -211,7 +211,10 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
           }
         }
 
-        const BATCH_SIZE = 5;
+        // Process items one at a time (BATCH_SIZE=1) instead of 5 at a time.
+        // PGP operations are CPU-intensive and run on the JS thread in RN;
+        // processing 5 concurrently blocks touch events for too long.
+        const BATCH_SIZE = 1;
         const decryptedItems: VaultItem[] = [];
         let decryptedCount = 0;
 
@@ -307,9 +310,10 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
           }
 
           // Yield to the React Native UI thread every batch so that taps/buttons
-          // don't freeze during a large vault decryption pass.
+          // don't freeze during a large vault decryption pass. 50ms gives the
+          // native touch handler enough time to process queued gestures.
           if (i + BATCH_SIZE < toDecrypt.length) {
-            await new Promise<void>((r) => setTimeout(r, 0));
+            await new Promise<void>((r) => setTimeout(r, 50));
           }
         }
 

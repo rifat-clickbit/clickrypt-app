@@ -33,7 +33,7 @@ import { requestNotificationPermissions } from './src/services/notificationServi
 
 const MainNavigator = () => {
   const { isAuthenticated, isLoading, unlockWithBiometrics, unlockVault, appMode, startupState, credentialsResolved } = useAuth();
-  const { activeTab, setActiveTab, isSyncing } = useVault();
+  const { activeTab, setActiveTab, isSyncing, items } = useVault();
   const { colors } = useTheme();
   const [isVaultLocked, setIsVaultLocked] = useState(false);
   const [passwordInput, setPasswordInput] = useState('');
@@ -42,14 +42,8 @@ const MainNavigator = () => {
   const backgroundTimeRef = useRef<number | null>(null);
 
   // === TEMPORARY DEBUG OVERLAY ===
-  // Shows the startup state on-screen so we can diagnose freezes without
-  // needing Metro terminal logs. Remove after debugging is complete.
-  const [debugTick, setDebugTick] = useState(0);
-  useEffect(() => {
-    const interval = setInterval(() => setDebugTick((t) => t + 1), 500);
-    return () => clearInterval(interval);
-  }, []);
-  const debugText = `startup=${startupState} auth=${isAuthenticated} loading=${isLoading} creds=${credentialsResolved} syncing=${isSyncing} tab=${activeTab} tick=${debugTick}`;
+  // Static debug text (no interval re-renders that could interfere with touch).
+  const debugText = `startup=${startupState} auth=${isAuthenticated} loading=${isLoading} creds=${credentialsResolved} syncing=${isSyncing} tab=${activeTab} items=${items.length}`;
   // === END DEBUG OVERLAY ===
 
   // If switched to personal mode while on team tab, switch to passwords
