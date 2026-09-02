@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS public.groups (
     description TEXT,
     mode TEXT DEFAULT 'organization' NOT NULL,
     data JSONB DEFAULT '{}'::jsonb,
+    created_by TEXT REFERENCES public.users(id) ON DELETE SET NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
 );
 

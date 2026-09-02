@@ -294,13 +294,24 @@ export const SettingsScreen = () => {
     try {
       const res = await deleteAccount();
       if (!res.success) {
-        Alert.alert('Error', res.error || 'Failed to delete account.');
+        const detail = res.failedTable
+          ? `Failed at step "${res.failedStep}" (${res.failedTable}): ${res.error || 'Unknown error'}`
+          : res.error || 'Failed to delete account.';
+        Alert.alert('Account Deletion Failed', detail);
         setIsDeletingAccount(false);
         return;
       }
       setIsDeleteModalOpen(false);
       setDeleteConfirmText('');
-      Alert.alert('Account Deleted', 'Your account and all vault data have been permanently removed.');
+
+      let successMsg = 'Your account and all vault data have been permanently removed.';
+      if (res.legacyGroupsSkipped) {
+        successMsg += '\n\nNote: one or more organization groups could not be deleted because their creator is not recorded in the database.';
+      }
+      if (res.warnings && res.warnings.length > 0) {
+        successMsg += `\n\nAdditional notes:\n${res.warnings.join('\n')}`;
+      }
+      Alert.alert('Account Deleted', successMsg);
     } catch {
       Alert.alert('Error', 'An unexpected error occurred during account deletion.');
     } finally {

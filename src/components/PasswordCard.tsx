@@ -27,9 +27,11 @@ import { useVault } from '../context/VaultContext';
 import { useAuth } from '../context/AuthContext';
 import { useTheme } from '../theme/ThemeContext';
 import {
-  generateTOTPCode,
   decryptSecret,
   isEncryptedCipher,
+  VaultLockedError,
+  DecryptionFailedError,
+  isDecryptionKeyAvailable,
 } from '../crypto/cryptoEngine';
 
 interface PasswordCardProps {
@@ -60,26 +62,16 @@ export const PasswordCard: React.FC<PasswordCardProps> = ({
   const [isExpanded, setIsExpanded] = useState(initialExpanded);
   const [isRevealed, setIsRevealed] = useState(false);
   const [isRevealing, setIsRevealing] = useState(false);
+  const [revealError, setRevealError] = useState<string | null>(null);
   const [showUnlockModal, setShowUnlockModal] = useState(false);
   const [decryptedText, setDecryptedText] = useState('');
   const [isCopied, setIsCopied] = useState(false);
   const [isNoteCopied, setIsNoteCopied] = useState(false);
-  const [isTotpCopied, setIsTotpCopied] = useState(false);
-  const [totpData, setTotpData] = useState({ code: '849 201', secondsRemaining: 30 });
 
   const isNote = item.itemType === 'note';
   const safeName = item.name || (item as any).title || (item as any).label || 'Untitled';
   const safeUsername = item.username || (item as any).user || (item as any).email || '—';
   const safeUrl = item.url || (item as any).website || '—';
-
-  useEffect(() => {
-    if (isNote) return;
-    const interval = setInterval(() => {
-      const totp = generateTOTPCode(safeName);
-      setTotpData(totp);
-    }, 1000);
-    return () => clearInterval(interval);
-  }, [safeName, isNote]);
 
   // Generate 2-character avatar initials
   const initials = safeName
@@ -93,11 +85,13 @@ export const PasswordCard: React.FC<PasswordCardProps> = ({
   const handleToggleReveal = async () => {
     if (isRevealed) {
       setIsRevealed(false);
+      setRevealError(null);
       return;
     }
 
     if (item.decryptedPassword && !isEncryptedCipher(item.decryptedPassword)) {
       setDecryptedText(item.decryptedPassword);
+      setRevealError(null);
       setIsRevealed(true);
       return;
     }
@@ -105,22 +99,31 @@ export const PasswordCard: React.FC<PasswordCardProps> = ({
     const activeKey = unlockedPgpKey || (await AsyncStorage.getItem('clickrypt_unlocked_pgp_key'));
     const activePass = masterPassword || (await AsyncStorage.getItem('clickrypt_master_password'));
 
-    if (!activeKey && !activePass) {
+    if (!isDecryptionKeyAvailable(activeKey, activePass, user?.encryptedPrivateKey)) {
       setShowUnlockModal(true);
       return;
     }
 
     setIsRevealing(true);
+    setRevealError(null);
     try {
       const secret = await revealPassword(item);
       if (secret && !isEncryptedCipher(secret)) {
         setDecryptedText(secret);
+        setIsRevealed(true);
       }
-    } catch {
-      // ignore
+    } catch (err: any) {
+      if (err instanceof VaultLockedError) {
+        setShowUnlockModal(true);
+      } else if (err instanceof DecryptionFailedError) {
+        setRevealError('This item\'s encrypted data is corrupted or was created by an older app version. Tap "Re-save" to re-enter the password.');
+        setIsRevealed(false);
+      } else {
+        setRevealError('Unable to decrypt this item. Tap "Re-save" to re-enter the password.');
+        setIsRevealed(false);
+      }
     } finally {
       setIsRevealing(false);
-      setIsRevealed(true);
     }
   };
 
@@ -129,16 +132,25 @@ export const PasswordCard: React.FC<PasswordCardProps> = ({
     if (ok) {
       setShowUnlockModal(false);
       setIsRevealing(true);
+      setRevealError(null);
       try {
         const secret = await revealPassword(item);
         if (secret && !isEncryptedCipher(secret)) {
           setDecryptedText(secret);
+          setIsRevealed(true);
         }
-      } catch {
-        // ignore
+      } catch (err: any) {
+        if (err instanceof VaultLockedError) {
+          setShowUnlockModal(true);
+        } else if (err instanceof DecryptionFailedError) {
+          setRevealError('This item\'s encrypted data is corrupted or was created by an older app version. Tap "Re-save" to re-enter the password.');
+          setIsRevealed(false);
+        } else {
+          setRevealError('Unable to decrypt this item. Tap "Re-save" to re-enter the password.');
+          setIsRevealed(false);
+        }
       } finally {
         setIsRevealing(false);
-        setIsRevealed(true);
       }
       refreshVault().catch(() => {});
       return true;
@@ -147,11 +159,23 @@ export const PasswordCard: React.FC<PasswordCardProps> = ({
   };
 
   const handleCopy = async () => {
-    const secret = decryptedText || item.decryptedPassword || item.noteContent || (await revealPassword(item));
-    if (secret) {
-      await Clipboard.setStringAsync(secret);
-      setIsCopied(true);
-      setTimeout(() => setIsCopied(false), 2000);
+    const activeKey = unlockedPgpKey || (await AsyncStorage.getItem('clickrypt_unlocked_pgp_key'));
+    const activePass = masterPassword || (await AsyncStorage.getItem('clickrypt_master_password'));
+    if (!isDecryptionKeyAvailable(activeKey, activePass, user?.encryptedPrivateKey)) {
+      setShowUnlockModal(true);
+      return;
+    }
+    try {
+      const secret = decryptedText || item.decryptedPassword || item.noteContent || (await revealPassword(item));
+      if (secret) {
+        await Clipboard.setStringAsync(secret);
+        setIsCopied(true);
+        setTimeout(() => setIsCopied(false), 2000);
+      }
+    } catch (err: any) {
+      if (err instanceof VaultLockedError) {
+        setShowUnlockModal(true);
+      }
     }
   };
 
@@ -160,12 +184,6 @@ export const PasswordCard: React.FC<PasswordCardProps> = ({
     await Clipboard.setStringAsync(item.noteContent);
     setIsNoteCopied(true);
     setTimeout(() => setIsNoteCopied(false), 2000);
-  };
-
-  const handleCopyTotp = async () => {
-    await Clipboard.setStringAsync(totpData.code.replace(/\s+/g, ''));
-    setIsTotpCopied(true);
-    setTimeout(() => setIsTotpCopied(false), 2000);
   };
 
   const handleOpenUrl = () => {
@@ -358,6 +376,32 @@ export const PasswordCard: React.FC<PasswordCardProps> = ({
                 <View style={styles.passVal}>
                   {isRevealing ? (
                     <ActivityIndicator size="small" color={colors.cyan} style={{ marginRight: 6 }} />
+                  ) : revealError ? (
+                    <TouchableOpacity
+                      onPress={() => onEdit(item)}
+                      activeOpacity={0.7}
+      hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                    >
+                      <Text
+                        style={[
+                          styles.secretValue,
+                          { color: colors.danger, letterSpacing: 0 },
+                        ]}
+                        numberOfLines={2}
+                      >
+                        {revealError}
+                      </Text>
+                      <Text
+                        style={{
+                          color: colors.warning,
+                          fontSize: 11,
+                          fontWeight: '600',
+                          marginTop: 2,
+                        }}
+                      >
+                        Re-save →
+                      </Text>
+                    </TouchableOpacity>
                   ) : (
                     <Text
                       style={[

@@ -1,9 +1,17 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
-import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
+import React, {
+  createContext,
+  useContext,
+  useState,
+  useEffect,
+  useCallback,
+  useRef,
+  ReactNode,
+} from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from '../services/supabaseClient';
+import { setupOfflineAutoSync } from '../services/offlineQueue';
 import { useAuth } from './AuthContext';
-import { VaultItem, FolderItem } from '../types';
+import { VaultItem, FolderItem, UserProfile } from '../types';
 import {
   encryptSecret,
   decryptSecret,
@@ -12,10 +20,18 @@ import {
   decryptWithPrivateKey,
   isEncryptedCipher,
   resolveBestSecret,
+  getUnlockedPrivateKey,
+  VaultLockedError,
+  DecryptionFailedError,
+  isDecryptionKeyAvailable,
 } from '../crypto/cryptoEngine';
 import { checkPasswordBreach } from '../services/breachScanner';
-import { queueMutation, setupOfflineAutoSync } from '../services/offlineQueue';
+import { queueMutation } from '../services/offlineQueue';
+import { withTimeout } from '../utils/withTimeout';
 import { logActivity } from '../services/activityLogService';
+import { fetchVaultDirect } from '../services/vaultFetcher';
+
+type AppMode = 'personal' | 'organization';
 
 export type FilterMode =
   | 'all'
@@ -28,7 +44,7 @@ export type FilterMode =
   | 'notes'
   | 'trash';
 
-export type TabType = 'passwords' | 'cards' | 'folders' | 'team' | 'settings';
+type TabType = 'passwords' | 'cards' | 'folders' | 'team' | 'settings';
 
 interface VaultContextType {
   items: VaultItem[];
@@ -57,8 +73,14 @@ interface VaultContextType {
     itemType?: 'login' | 'card' | 'note';
     noteContent?: string;
   }) => Promise<boolean>;
-  updateItem: (id: string, updates: Partial<VaultItem> & { password?: string }) => Promise<boolean>;
-  batchMoveToFolder: (itemIds: string[], targetFolderId: string | null) => Promise<boolean>;
+  updateItem: (
+    id: string,
+    updates: Partial<VaultItem> & { password?: string }
+  ) => Promise<boolean>;
+  batchMoveToFolder: (
+    itemIds: string[],
+    targetFolderId: string | null
+  ) => Promise<boolean>;
   deleteItem: (id: string) => Promise<boolean>;
   restoreItem: (id: string) => Promise<boolean>;
   purgeItem: (id: string) => Promise<boolean>;
@@ -75,12 +97,45 @@ interface VaultContextType {
 
 const VaultContext = createContext<VaultContextType | undefined>(undefined);
 
+const persistableItem = (item: VaultItem): any => {
+  // Strip all plaintext/decrypted fields so they never get persisted to the DB.
+  // `password` leaks in via updateItem's `...updates` spread.
+  const { decryptedPassword, noteContent, password, ...rest } = item as any;
+  return rest;
+};
+
+const loadCachedVault = async (appMode: AppMode): Promise<VaultItem[]> => {
+  try {
+    const cached = await AsyncStorage.getItem(
+      `clickrypt_cached_vault_${appMode}`
+    );
+    if (cached) {
+      const parsed = JSON.parse(cached);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        return parsed;
+      }
+    }
+  } catch (e) {
+    console.warn('[Vault] load cached failed', e);
+  }
+  return [];
+};
+
 export const VaultProvider = ({ children }: { children: ReactNode }) => {
-  const { user, appMode, masterPassword, unlockedPgpKey } = useAuth();
+  const {
+    user,
+    appMode,
+    masterPassword,
+    unlockedPgpKey,
+    credentialsResolved,
+  } = useAuth();
+
   const [items, setItems] = useState<VaultItem[]>([]);
+  const [rawItems, setRawItems] = useState<VaultItem[]>([]);
   const [folders, setFolders] = useState<FolderItem[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
+
   const [filterMode, setFilterMode] = useState<FilterMode>('all');
   const [selectedFolderId, setSelectedFolderId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
@@ -88,377 +143,415 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
   const [isFilterOpen, setIsFilterOpen] = useState(false);
   const [isFolderDropdownOpen, setIsFolderDropdownOpen] = useState(false);
 
+  const isFetchingRef = useRef(false);
+  const pendingFetchRef = useRef(false);
+  const subscribedRef = useRef<string | null>(null);
+  const initialSyncRef = useRef<string | null>(null);
+  const lastRawKeyRef = useRef<string>('');
+
+  // Keep the latest user in a ref so fetchVaultData can stay identity-stable.
+  // AuthContext replaces the user OBJECT on every profile rehydration even
+  // though user.id is the same; keying callbacks on the object identity made
+  // every rehydration tear down realtime subscriptions and re-run the full
+  // initial sync (the "permanently syncing..." churn).
+  const userRef = useRef(user);
   useEffect(() => {
-    fetchVaultData();
+    userRef.current = user;
+  }, [user]);
 
-    // Setup offline auto-sync when network returns
-    const unsubscribeNet = setupOfflineAutoSync(() => {
-      fetchVaultData(false);
-    });
+  const invalidateVaultCache = useCallback(async () => {
+    if (!user) return;
+    await withTimeout(
+      supabase.functions.invoke('vault-cache-invalidate', { body: { appMode } }),
+      10000,
+      'vault-cache-invalidate'
+    ).catch(() => {});
+  }, [user, appMode]);
 
-    // Unique channel per mount with proper cleanup
-    const channelName = `public_sync_${Date.now()}`;
+  const decryptRawItems = useCallback(
+    async (toDecrypt: VaultItem[], fromCache = false) => {
+      try {
+        const activePass =
+          masterPassword ||
+          (await AsyncStorage.getItem('clickrypt_master_password'));
+
+        // Prefer the already-unlocked private key. If it is not in state/storage,
+        // fall back to the encrypted private key in the user record so we can try
+        // to unlock it with the master password.
+        let activeKey =
+          unlockedPgpKey ||
+          (await AsyncStorage.getItem('clickrypt_unlocked_pgp_key'));
+        if (!activeKey && user?.encryptedPrivateKey) {
+          activeKey = user.encryptedPrivateKey;
+        }
+
+        const hasKey = isDecryptionKeyAvailable(activeKey, activePass, user?.encryptedPrivateKey);
+        console.log(`[Vault] decryptRawItems: hasKey=${hasKey}, activeKey=${!!activeKey}, activePass=${!!activePass}, userEncryptedPrivateKey=${!!user?.encryptedPrivateKey}`);
+
+        // Pre-warm the private-key cache once so the PGP module is loaded and the
+        // key is parsed/unlocked before the per-item loop starts. This prevents
+        // every item from paying the parse cost and avoids a race where multiple
+        // concurrent decrypt calls would each re-parse the key.
+        if (activeKey) {
+          try {
+            await getUnlockedPrivateKey(activeKey, activePass || undefined);
+          } catch (err: any) {
+            console.warn('[Vault] pre-warm key cache failed:', err?.message || err);
+          }
+        }
+
+        const BATCH_SIZE = 5;
+        const decryptedItems: VaultItem[] = [];
+        let decryptedCount = 0;
+
+        const decryptOne = async (item: VaultItem) => {
+          if (
+            item.decryptedPassword &&
+            typeof item.decryptedPassword === 'string' &&
+            !isEncryptedCipher(item.decryptedPassword)
+          ) {
+            decryptedCount++;
+            return item;
+          }
+
+          const userSecret = resolveBestSecret(
+            item,
+            user?.id,
+            user?.role,
+            user?.email
+          );
+          const rawBlob = userSecret?.encryptedData;
+
+          if (item.encryptedSymmetricKey && (activeKey || activePass)) {
+            try {
+              const symKey = await decryptWithPrivateKey(
+                item.encryptedSymmetricKey,
+                activeKey || undefined,
+                activePass || undefined
+              );
+              if (symKey && rawBlob) {
+                // The symmetric key is the *password* for the encrypted blob,
+                // not a PGP private key.
+                const dec = await decryptSecret(rawBlob, undefined, symKey);
+                if (dec && !isEncryptedCipher(dec)) {
+                  decryptedCount++;
+                  return item.itemType === 'note'
+                    ? { ...item, noteContent: dec }
+                    : { ...item, decryptedPassword: dec };
+                }
+              }
+            } catch (err: any) {
+              console.warn(`[Vault] decryptOne symmetric-key branch failed for item ${item.id}:`, err?.message || err);
+            }
+          }
+
+          if (
+            rawBlob &&
+            typeof rawBlob === 'string' &&
+            (activeKey || activePass)
+          ) {
+            try {
+              const dec = await decryptSecret(
+                rawBlob,
+                activeKey || undefined,
+                activePass || undefined
+              );
+              if (dec && !isEncryptedCipher(dec)) {
+                decryptedCount++;
+                return item.itemType === 'note'
+                  ? { ...item, noteContent: dec }
+                  : { ...item, decryptedPassword: dec };
+              }
+            } catch (err: any) {
+              console.warn(`[Vault] decryptOne direct-PGP branch failed for item ${item.id}:`, err?.message || err);
+            }
+          }
+
+          return item;
+        };
+
+        for (let i = 0; i < toDecrypt.length; i += BATCH_SIZE) {
+          const chunk = toDecrypt.slice(i, i + BATCH_SIZE);
+          const results = await Promise.all(chunk.map(decryptOne));
+          decryptedItems.push(...results);
+
+          // Yield to the React Native UI thread every batch so that taps/buttons
+          // don't freeze during a large vault decryption pass.
+          if (i + BATCH_SIZE < toDecrypt.length) {
+            await new Promise<void>((r) => setTimeout(r, 0));
+          }
+        }
+
+        setItems(decryptedItems);
+        await AsyncStorage.setItem(
+          `clickrypt_cached_vault_${appMode}`,
+          JSON.stringify(decryptedItems)
+        );
+        console.log(`[Vault] decryption pass finished, count ${decryptedCount}`);
+      } catch (e) {
+        console.warn('[Vault] decryption failed', e);
+      }
+    },
+    [appMode, masterPassword, unlockedPgpKey, user]
+  );
+
+  const fetchVaultData = useCallback(
+    async (showLoading: boolean) => {
+      if (isFetchingRef.current) {
+        pendingFetchRef.current = true;
+        return;
+      }
+
+      isFetchingRef.current = true;
+      pendingFetchRef.current = false;
+
+      if (showLoading) setIsLoading(true);
+      setIsSyncing(true);
+
+      let shouldRecurse = false;
+
+      try {
+        const currentUser = userRef.current;
+        if (!currentUser) {
+          const cached = await withTimeout(
+            loadCachedVault(appMode),
+            5000,
+            'fetchVaultData loadCachedVault (no user)'
+          ).catch(() => [] as VaultItem[]);
+          setItems(cached);
+          setRawItems(cached);
+          return;
+        }
+
+        const { data, error } = await withTimeout(
+          supabase.functions.invoke('vault-cache', {
+            body: { appMode },
+          }),
+          15000,
+          'vault-cache'
+        );
+
+        if (error || !data) {
+          throw error || new Error('empty vault-cache response');
+        }
+
+        setFolders(data.folders || []);
+        setRawItems(data.items || []);
+        // Decryption is handled by the dedicated effect below once credentials
+        // are resolved, so we don't duplicate work here.
+      } catch (e) {
+        console.warn(`[Vault] edge function failed for ${userRef.current?.id}, mode ${appMode}`, e);
+
+        // Fallback: query Supabase directly so the app still works when the
+        // edge function is broken or unreachable.
+        try {
+          const currentUser = userRef.current;
+          if (currentUser) {
+            const direct = await withTimeout(
+              fetchVaultDirect(supabase, currentUser, appMode),
+              15000,
+              'vault-fetch-direct'
+            );
+            if (direct && direct.items) {
+              console.log(`[Vault] direct fallback returned ${direct.items.length} items, ${direct.folders.length} folders`);
+              setFolders(direct.folders || []);
+              setRawItems(direct.items || []);
+              return;
+            }
+          }
+        } catch (directErr) {
+          console.warn('[Vault] direct fallback failed', directErr);
+        }
+
+        const cached = await withTimeout(
+          loadCachedVault(appMode),
+          5000,
+          'fetchVaultData loadCachedVault (fallback)'
+        ).catch(() => [] as VaultItem[]);
+        setItems(cached);
+        setRawItems(cached);
+      } finally {
+        isFetchingRef.current = false;
+        setIsLoading(false);
+        setIsSyncing(false);
+        shouldRecurse = pendingFetchRef.current;
+        if (shouldRecurse) {
+          pendingFetchRef.current = false;
+        }
+      }
+
+      if (shouldRecurse) {
+        await fetchVaultData(false);
+      }
+    },
+    [appMode] // userRef.current is read at call-time; no need to key on user object
+  );
+
+  // Load cached items immediately for instant UI availability
+  useEffect(() => {
+    (async () => {
+      const cached = await loadCachedVault(appMode);
+      if (cached.length > 0) {
+        setItems(cached);
+        setRawItems(cached);
+      }
+    })();
+  }, [appMode]);
+
+  // Network sync, realtime subscriptions, and offline auto-sync
+  useEffect(() => {
+    const syncKey = `${appMode}-${user?.id || 'anon'}`;
+
+    // Load from cache when there is no logged-in user
+    if (!user?.id) {
+      loadCachedVault(appMode).then((cached) => {
+        if (cached.length > 0) {
+          setItems(cached);
+          setRawItems(cached);
+        }
+      });
+    }
+
+    // Do the initial network sync only once per (appMode, user) combination.
+    // The previous implementation re-fetched every time `items`/`rawItems`
+    // changed, which created an infinite re-render/re-subscription loop.
+    if (user?.id && initialSyncRef.current !== syncKey) {
+      initialSyncRef.current = syncKey;
+      fetchVaultData(true);
+    }
+
+    let syncTimeout: ReturnType<typeof setTimeout> | null = null;
+    const debouncedFetch = () => {
+      if (syncTimeout) clearTimeout(syncTimeout);
+      syncTimeout = setTimeout(() => {
+        if (user?.id) {
+          fetchVaultData(false);
+        }
+      }, 1500);
+    };
+
+    const unsubscribeNet = setupOfflineAutoSync(debouncedFetch);
+
+    // Subscribe to realtime updates only once per (appMode, user).
+    if (subscribedRef.current === syncKey) {
+      return () => {
+        if (syncTimeout) clearTimeout(syncTimeout);
+        unsubscribeNet();
+      };
+    }
+    subscribedRef.current = syncKey;
+
+    const channelName = `vault_sync_${syncKey}_${Date.now()}`;
+    // Filter realtime events to only rows this user owns or is a recipient of.
+    // Without filters, ANY user's write to these tables triggers a resync,
+    // which keeps the app perpetually in "syncing..." state.
+    const userIds = [user?.id, user?.authId].filter(Boolean) as string[];
+    const ownerIdFilter = `owner_id=in.(${userIds.join(',')})`;
+    const recipientFilter = `recipient_id=in.(${userIds.join(',')})`;
+
     const channel = supabase
       .channel(channelName)
       .on(
         'postgres_changes',
-        { event: '*', schema: 'public', table: 'resources' },
-        () => {
-          fetchVaultData(false);
-        }
+        { event: '*', schema: 'public', table: 'resources', filter: ownerIdFilter },
+        debouncedFetch
       )
       .on(
         'postgres_changes',
-        { event: '*', schema: 'public', table: 'folders' },
-        () => {
-          fetchVaultData(false);
-        }
+        { event: '*', schema: 'public', table: 'folders', filter: ownerIdFilter },
+        debouncedFetch
       )
       .on(
         'postgres_changes',
-        { event: '*', schema: 'public', table: 'resource_shares' },
-        () => {
-          fetchVaultData(false);
-        }
+        { event: '*', schema: 'public', table: 'resource_shares', filter: recipientFilter },
+        debouncedFetch
       )
       .subscribe();
 
     return () => {
+      if (syncTimeout) clearTimeout(syncTimeout);
       unsubscribeNet();
       try {
         supabase.removeChannel(channel);
       } catch {
         // ignore
       }
+      // Allow re-subscription when the user or appMode actually changes
+      subscribedRef.current = null;
+      initialSyncRef.current = null;
     };
-  }, [appMode, user?.id]);
+  }, [appMode, fetchVaultData, user?.id]);
 
-  const fetchVaultData = async (showLoading = true) => {
-    if (showLoading) setIsLoading(true);
-    setIsSyncing(true);
-    try {
-      if (!user) {
-        setItems([]);
-        setFolders([]);
-        return;
+  // Decrypt raw items once credentials are resolved
+  useEffect(() => {
+    if (credentialsResolved && rawItems.length > 0) {
+      const rawKey = rawItems.map((i) => i.id).join(',');
+      if (rawKey !== lastRawKeyRef.current) {
+        lastRawKeyRef.current = rawKey;
+        decryptRawItems(rawItems, true);
       }
-
-      // 1. Fetch Folders (Only for this user or mode)
-      const { data: folderRows } = await supabase
-        .from('folders')
-        .select('*')
-        .eq('mode', appMode);
-
-      if (folderRows && folderRows.length > 0) {
-        setFolders(
-          folderRows.map((f: any) => ({
-            id: f.id,
-            name: f.name || f.data?.name || 'Folder',
-            description: f.description || f.data?.description,
-            color: f.data?.color || f.color || '#FBBF24',
-            itemCount: f.data?.itemCount || f.item_count || 0,
-            lastModified: f.last_modified || f.data?.lastModified || f.created_at || 'Just now',
-            mode: f.mode,
-            isPrivateOnly: f.data?.isPrivateOnly,
-          }))
-        );
-      } else {
-        setFolders([]);
-      }
-
-      // 2. Fetch Resources owned by or shared with this user
-      const { data: resourceRows, error } = await supabase
-        .from('resources')
-        .select('*')
-        .eq('mode', appMode);
-
-      // 3. Fetch resource shares for this user
-      const { data: shareRows } = await supabase
-        .from('resource_shares')
-        .select('*')
-        .eq('recipient_id', user.id);
-
-      const sharedResourceIds = (shareRows || []).map((s: any) => s.resource_id);
-
-      if (!error && resourceRows && resourceRows.length > 0) {
-        const parsed: VaultItem[] = resourceRows
-          .filter((r: any) => r.owner_id === user.id || r.data?.ownerId === user.id || sharedResourceIds.includes(r.id))
-          .map((r: any) => {
-            let d: any = {};
-            if (r.data) {
-              if (typeof r.data === 'string') {
-                try {
-                  d = JSON.parse(r.data);
-                } catch {
-                  d = {};
-                }
-              } else if (typeof r.data === 'object' && r.data !== null) {
-                d = r.data;
-              }
-            }
-            const isShared = sharedResourceIds.includes(r.id);
-            const rawSecrets = Array.isArray(d.secrets) && d.secrets.length > 0
-              ? d.secrets
-              : Array.isArray(r.secrets) && r.secrets.length > 0
-              ? r.secrets
-              : d.encryptedData
-              ? [{ userId: user.id, encryptedData: d.encryptedData }]
-              : r.encrypted_data
-              ? [{ userId: user.id, encryptedData: r.encrypted_data }]
-              : [];
-
-            const candidateSecret = d.encryptedData || d.encryptedPassword || r.encrypted_data || d.password || r.password || d.secret || r.secret;
-            const finalSecrets = rawSecrets.length > 0
-              ? rawSecrets
-              : candidateSecret && typeof candidateSecret === 'string' && isEncryptedCipher(candidateSecret)
-              ? [{ userId: user.id, encryptedData: candidateSecret }]
-              : [];
-
-            const rawName = d.name || r.name || d.title || r.title || d.label || r.label || 'Untitled Item';
-            const rawUsername = d.username || r.username || d.user || r.user || d.email || r.email || '';
-            const rawUrl = d.url || r.url || d.website || r.website || '';
-            const rawPassword =
-              d.decryptedPassword && !isEncryptedCipher(d.decryptedPassword)
-                ? d.decryptedPassword
-                : d.password && !isEncryptedCipher(d.password)
-                ? d.password
-                : undefined;
-            const rawNote = d.noteContent || (d.itemType === 'note' && !isEncryptedCipher(d.decryptedPassword || d.password) ? (d.decryptedPassword || d.password) : undefined);
-
-            return {
-              ...d,
-              id: r.id,
-              name: rawName,
-              username: rawUsername,
-              url: rawUrl,
-              folderId: r.folder_id || d.folderId || null,
-              ownerId: r.owner_id || d.ownerId || user?.id,
-              isPrivateOnly: !!(d.isPrivateOnly || r.item_type === 'card' || d.itemType === 'card'),
-              score: typeof d.score === 'number' ? d.score : 80,
-              strength: d.strength || 'Good',
-              lastModified: d.lastModified || r.updated_at || 'Recently',
-              isOld: !!d.isOld,
-              isLeaked: !!d.isLeaked,
-              secrets: finalSecrets,
-              tags: Array.isArray(d.tags) ? d.tags : [],
-              mode: r.mode || d.mode || appMode,
-              decryptedPassword: rawPassword,
-              noteContent: rawNote,
-              itemType: r.item_type || d.itemType || (d.isPrivateOnly ? 'card' : 'login'),
-              isDeleted: !!d.isDeleted,
-              deletedAt: d.deletedAt,
-              sharedWith: Array.isArray(d.sharedWith) ? d.sharedWith : (isShared ? [user.id] : []),
-              sharedWithMembers: Array.isArray(d.sharedWithMembers) ? d.sharedWithMembers : [],
-              ownerName: d.ownerName || r.owner_name,
-              ownerEmail: d.ownerEmail || r.owner_email,
-            };
-          });
-
-        const activeKey = unlockedPgpKey || (await AsyncStorage.getItem('clickrypt_unlocked_pgp_key'));
-        const activePass = masterPassword || (await AsyncStorage.getItem('clickrypt_master_password'));
-
-        const decryptedItems = await Promise.all(
-          parsed.map(async (item) => {
-            if (item.decryptedPassword && !isEncryptedCipher(item.decryptedPassword)) {
-              return item;
-            }
-            const userSecret = resolveBestSecret(item, user.id, user.role, user.email);
-            const rawBlob = userSecret?.encryptedData;
-            if (rawBlob && typeof rawBlob === 'string' && (activeKey || activePass)) {
-              try {
-                const dec = await decryptSecret(rawBlob, activeKey || undefined, activePass || undefined);
-                if (dec && !isEncryptedCipher(dec)) {
-                  return { ...item, decryptedPassword: dec };
-                }
-              } catch {}
-            }
-            return item;
-          })
-        );
-
-        setItems(decryptedItems);
-        await AsyncStorage.setItem(`clickrypt_cached_vault_${appMode}`, JSON.stringify(decryptedItems));
-      } else {
-        const cached = await AsyncStorage.getItem(`clickrypt_cached_vault_${appMode}`);
-        if (cached) {
-          try {
-            const parsedCached = JSON.parse(cached);
-            if (Array.isArray(parsedCached)) {
-              setItems(
-                parsedCached.map((item: any) => ({
-                  ...item,
-                  name: item.name || item.title || 'Untitled Item',
-                  username: item.username || item.user || '',
-                  url: item.url || item.website || '',
-                }))
-              );
-            } else {
-              setItems([]);
-            }
-          } catch {
-            setItems([]);
-          }
-        } else {
-          setItems([]);
-        }
-      }
-    } catch {
-      setItems([]);
-    } finally {
-      setIsLoading(false);
-      setIsSyncing(false);
     }
-  };
+  }, [credentialsResolved, rawItems, decryptRawItems]);
 
-  const createItem = async (payload: {
-    name: string;
-    username?: string;
-    url?: string;
-    password?: string;
-    folderId?: string | null;
-    isPrivateOnly?: boolean;
-    itemType?: 'login' | 'card' | 'note';
-    noteContent?: string;
-  }) => {
-    try {
-      if (!user) return false;
-      const secretToEncrypt = payload.password || payload.noteContent || '';
-      
-      // 1. Generate random symmetric AES key for item
-      const itemSymmetricKey = generateSymmetricKey();
-      const encryptedBlob = await encryptSecret(secretToEncrypt, itemSymmetricKey);
-      
-      // 2. Encrypt item's symmetric key with owner's RSA public key
-      const encryptedKeyForOwner = await encryptWithPublicKey(itemSymmetricKey, user.publicKey);
-      
-      // Check for data breach asynchronously (for passwords)
-      let isBreached = false;
-      if (payload.password && payload.itemType !== 'note') {
-        const breachCheck = await checkPasswordBreach(payload.password);
-        isBreached = breachCheck.isBreached;
-      }
-
-      const itemType = payload.itemType || (payload.isPrivateOnly ? 'card' : 'login');
-
-      const newItem: VaultItem = {
-        id: `res-${Date.now()}`,
-        name: payload.name,
-        username: payload.username || '',
-        url: payload.url || '',
-        folderId: payload.folderId || null,
-        ownerId: user.id,
-        ownerName: user.name,
-        ownerEmail: user.email,
-        isPrivateOnly: !!payload.isPrivateOnly || itemType === 'card',
-        itemType,
-        noteContent: payload.noteContent,
-        isLeaked: isBreached,
-        isDeleted: false,
-        lastModified: new Date().toLocaleDateString('en-US', {
-          month: 'short',
-          day: 'numeric',
-          year: 'numeric',
-          hour: '2-digit',
-          minute: '2-digit',
-        }),
-        score: isBreached ? 20 : 90,
-        strength: isBreached ? 'Weak' : 'Strong',
-        secrets: [{ userId: user.id, encryptedData: encryptedBlob }],
-        mode: appMode,
-        decryptedPassword: secretToEncrypt,
-      };
-
-      const updated = [newItem, ...items];
-      setItems(updated);
-      await AsyncStorage.setItem(`clickrypt_cached_vault_${appMode}`, JSON.stringify(updated));
-
-      const typeLabel =
-        itemType === 'note'
-          ? 'Secure Note Created'
-          : itemType === 'card'
-          ? 'Payment Card Stored'
-          : 'Password Created';
-
-      await logActivity(
-        user.id,
-        user.email,
-        typeLabel,
-        `Added "${newItem.name}" to ${appMode === 'organization' ? 'Organization' : 'Personal'} Vault`,
-        'vault',
-        appMode
-      );
-
-      // Attempt Supabase persist with clean JSONB payload
+  const createItem = useCallback(
+    async (payload: {
+      name: string;
+      username?: string;
+      url?: string;
+      password?: string;
+      folderId?: string | null;
+      isPrivateOnly?: boolean;
+      itemType?: 'login' | 'card' | 'note';
+      noteContent?: string;
+    }) => {
       try {
-        const { error } = await supabase.from('resources').upsert({
-          id: newItem.id,
-          mode: appMode,
-          data: {
-            ...newItem,
-            ownerId: user.id,
-            folderId: payload.folderId || null,
-            itemType,
-            encryptedSymmetricKey: encryptedKeyForOwner,
-          },
-        });
-        if (error) throw error;
-      } catch {
-        await queueMutation({
-          action: 'UPSERT_RESOURCE',
-          table: 'resources',
-          recordId: newItem.id,
-          data: {
-            ...newItem,
-            ownerId: user.id,
-            folderId: payload.folderId || null,
-            itemType,
-            encryptedSymmetricKey: encryptedKeyForOwner,
-          },
-        });
-      }
+        if (!user) return false;
 
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
-  const updateItem = async (id: string, updates: Partial<VaultItem> & { password?: string }) => {
-    try {
-      if (!user) return false;
-      let encryptedBlob = '';
-      let isBreached = false;
-
-      const hasNewPassword = typeof updates.password === 'string' && updates.password.trim() !== '';
-      const hasNewNote = typeof updates.noteContent === 'string' && updates.noteContent.trim() !== '';
-
-      if (hasNewPassword || hasNewNote) {
-        const secretToEncrypt = (hasNewPassword ? updates.password : updates.noteContent) || '';
+        const secretToEncrypt = payload.password || payload.noteContent || '';
         const itemSymmetricKey = generateSymmetricKey();
-        encryptedBlob = await encryptSecret(secretToEncrypt, itemSymmetricKey);
-        if (hasNewPassword && updates.password) {
-          const breachCheck = await checkPasswordBreach(updates.password);
+        const encryptedBlob = await encryptSecret(secretToEncrypt, itemSymmetricKey);
+        const encryptedKeyForOwner = await encryptWithPublicKey(
+          itemSymmetricKey,
+          user.publicKey
+        );
+
+        // Pre-save validation: ensure both encryption steps produced valid
+        // PGP armored ciphertext. If either failed (e.g. due to a library
+        // API mismatch), throw instead of silently persisting broken data
+        // that can never be decrypted later.
+        if (secretToEncrypt &&
+            (!encryptedBlob || !encryptedBlob.includes('-----BEGIN PGP MESSAGE-----') ||
+             !encryptedKeyForOwner || !encryptedKeyForOwner.includes('-----BEGIN PGP MESSAGE-----'))) {
+          console.error('[Vault] addItem: encryption validation failed', {
+            hasBlob: !!encryptedBlob,
+            hasWrappedKey: !!encryptedKeyForOwner,
+          });
+          throw new Error('Failed to encrypt item: encryption produced invalid ciphertext. Item was not saved.');
+        }
+
+        let isBreached = false;
+        if (payload.password && payload.itemType !== 'note') {
+          const breachCheck = await checkPasswordBreach(payload.password);
           isBreached = breachCheck.isBreached;
         }
-      }
 
-      const updated = items.map((item) => {
-        if (item.id !== id) return item;
-        const newSecrets = (hasNewPassword || hasNewNote)
-          ? [{ userId: user.id, encryptedData: encryptedBlob }]
-          : item.secrets;
-        const newDecrypted = hasNewPassword
-          ? updates.password
-          : hasNewNote
-          ? updates.noteContent
-          : item.decryptedPassword;
-        return {
-          ...item,
-          ...updates,
-          decryptedPassword: newDecrypted,
-          noteContent: hasNewNote ? updates.noteContent : item.noteContent,
-          isLeaked: hasNewPassword ? isBreached : item.isLeaked,
-          secrets: newSecrets,
+        const itemType =
+          payload.itemType || (payload.isPrivateOnly ? 'card' : 'login');
+
+        const newItem: VaultItem = {
+          id: `res-${Date.now()}`,
+          name: payload.name,
+          username: payload.username || '',
+          url: payload.url || '',
+          folderId: payload.folderId || null,
+          ownerId: user.id,
+          ownerName: user.name,
+          ownerEmail: user.email,
+          isPrivateOnly: !!payload.isPrivateOnly || itemType === 'card',
+          itemType,
+          noteContent: payload.noteContent,
+          isLeaked: isBreached,
+          isDeleted: false,
           lastModified: new Date().toLocaleDateString('en-US', {
             month: 'short',
             day: 'numeric',
@@ -466,238 +559,504 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
             hour: '2-digit',
             minute: '2-digit',
           }),
+          score: isBreached ? 20 : 90,
+          strength: isBreached ? 'Weak' : 'Strong',
+          secrets: [{ userId: user.id, encryptedData: encryptedBlob }],
+          mode: appMode,
+          decryptedPassword: secretToEncrypt,
         };
-      });
 
-      setItems(updated);
-      await AsyncStorage.setItem(`clickrypt_cached_vault_${appMode}`, JSON.stringify(updated));
+        const updated = [newItem, ...items];
+        setItems(updated);
+        await AsyncStorage.setItem(
+          `clickrypt_cached_vault_${appMode}`,
+          JSON.stringify(updated)
+        );
 
-      const target = updated.find((i) => i.id === id);
-      if (target) {
+        const typeLabel =
+          itemType === 'note'
+            ? 'Secure Note Created'
+            : itemType === 'card'
+            ? 'Payment Card Stored'
+            : 'Password Created';
+
         await logActivity(
           user.id,
           user.email,
-          'Vault Item Updated',
-          `Updated "${target.name}" in vault`,
+          typeLabel,
+          `Added "${newItem.name}" to ${
+            appMode === 'organization' ? 'Organization' : 'Personal'
+          } Vault`,
           'vault',
           appMode
         );
 
         try {
           const { error } = await supabase.from('resources').upsert({
-            id: target.id,
+            id: newItem.id,
             mode: appMode,
-            data: { ...target },
+            owner_id: user.id,
+            folder_id: payload.folderId || null,
+            data: {
+              ...persistableItem(newItem),
+              ownerId: user.id,
+              folderId: payload.folderId || null,
+              itemType,
+              encryptedSymmetricKey: encryptedKeyForOwner,
+            },
           });
           if (error) throw error;
         } catch {
           await queueMutation({
             action: 'UPSERT_RESOURCE',
             table: 'resources',
-            recordId: target.id,
-            data: { ...target },
+            recordId: newItem.id,
+            columns: {
+              owner_id: user.id,
+              folder_id: payload.folderId || null,
+            },
+            data: {
+              ...persistableItem(newItem),
+              ownerId: user.id,
+              folderId: payload.folderId || null,
+              itemType,
+              encryptedSymmetricKey: encryptedKeyForOwner,
+            },
           });
         }
+
+        invalidateVaultCache();
+        return true;
+      } catch {
+        return false;
       }
+    },
+    [appMode, invalidateVaultCache, items, user]
+  );
 
-      return true;
-    } catch {
-      return false;
-    }
-  };
+  const updateItem = useCallback(
+    async (id: string, updates: Partial<VaultItem> & { password?: string }) => {
+      try {
+        if (!user) return false;
 
-  const batchMoveToFolder = async (itemIds: string[], targetFolderId: string | null) => {
-    try {
-      if (!user) return false;
-      const updated = items.map((item) =>
-        itemIds.includes(item.id)
-          ? {
-              ...item,
-              folderId: targetFolderId,
-              lastModified: new Date().toLocaleDateString('en-US', {
-                month: 'short',
-                day: 'numeric',
-                year: 'numeric',
-                hour: '2-digit',
-                minute: '2-digit',
-              }),
+        let encryptedBlob = '';
+        let encryptedKeyForOwner = '';
+        let itemSymmetricKey = '';
+        let isBreached = false;
+
+        const hasNewPassword =
+          typeof updates.password === 'string' &&
+          updates.password.trim() !== '';
+        const hasNewNote =
+          typeof updates.noteContent === 'string' &&
+          updates.noteContent.trim() !== '';
+
+        if (hasNewPassword || hasNewNote) {
+          const secretToEncrypt = (hasNewPassword
+            ? updates.password
+            : updates.noteContent) as string;
+          itemSymmetricKey = generateSymmetricKey();
+          encryptedBlob = await encryptSecret(secretToEncrypt, itemSymmetricKey);
+          encryptedKeyForOwner = await encryptWithPublicKey(
+            itemSymmetricKey,
+            user.publicKey
+          );
+          // Pre-save validation: ensure both encryption steps produced valid
+          // PGP armored ciphertext. Prevents silently persisting broken data.
+          if (!encryptedBlob || !encryptedBlob.includes('-----BEGIN PGP MESSAGE-----') ||
+              !encryptedKeyForOwner || !encryptedKeyForOwner.includes('-----BEGIN PGP MESSAGE-----')) {
+            console.error('[Vault] updateItem: encryption validation failed', {
+              hasBlob: !!encryptedBlob,
+              hasWrappedKey: !!encryptedKeyForOwner,
+            });
+            throw new Error('Failed to encrypt item: encryption produced invalid ciphertext. Item was not updated.');
+          }
+          if (hasNewPassword && updates.password) {
+            const breachCheck = await checkPasswordBreach(updates.password);
+            isBreached = breachCheck.isBreached;
+          }
+        }
+
+        const updated = items.map((item) => {
+          if (item.id !== id) return item;
+          const newSecrets =
+            hasNewPassword || hasNewNote
+              ? [{ userId: user.id, encryptedData: encryptedBlob }]
+              : item.secrets;
+          const newDecrypted = hasNewPassword
+            ? updates.password
+            : hasNewNote
+            ? updates.noteContent
+            : item.decryptedPassword;
+          const newEncryptedSymmetricKey =
+            hasNewPassword || hasNewNote
+              ? encryptedKeyForOwner
+              : item.encryptedSymmetricKey;
+          return {
+            ...item,
+            ...updates,
+            decryptedPassword: newDecrypted,
+            noteContent: hasNewNote ? updates.noteContent : item.noteContent,
+            isLeaked: hasNewPassword ? isBreached : item.isLeaked,
+            secrets: newSecrets,
+            encryptedSymmetricKey: newEncryptedSymmetricKey,
+            lastModified: new Date().toLocaleDateString('en-US', {
+              month: 'short',
+              day: 'numeric',
+              year: 'numeric',
+              hour: '2-digit',
+              minute: '2-digit',
+            }),
+          } as VaultItem;
+        });
+
+        setItems(updated);
+        await AsyncStorage.setItem(
+          `clickrypt_cached_vault_${appMode}`,
+          JSON.stringify(updated)
+        );
+
+        const target = updated.find((i) => i.id === id);
+        if (target) {
+          await logActivity(
+            user.id,
+            user.email,
+            'Vault Item Updated',
+            `Updated "${target.name}" in vault`,
+            'vault',
+            appMode
+          );
+
+          // If the item is shared and the secret changed, re-wrap the new
+          // symmetric key for each existing recipient so they can still decrypt.
+          if (
+            (hasNewPassword || hasNewNote) &&
+            itemSymmetricKey &&
+            target.sharedWith?.length
+          ) {
+            try {
+              const { data: recipientProfiles } = await supabase
+                .from('users')
+                .select('id, public_key, data')
+                .in('id', target.sharedWith.filter(Boolean));
+
+              if (recipientProfiles && recipientProfiles.length > 0) {
+                await Promise.all(
+                  recipientProfiles.map(async (r: any) => {
+                    const recipientId = r.id;
+                    const recipientPubKey: string | null =
+                      r.public_key || r.data?.publicKey;
+                    if (!recipientPubKey || !recipientId) return;
+
+                    const reEncryptedKey = await encryptWithPublicKey(
+                      itemSymmetricKey,
+                      recipientPubKey
+                    );
+
+                    await supabase.from('resource_shares').upsert({
+                      id: `sh-${target.id}-${recipientId}`,
+                      resource_id: target.id,
+                      recipient_id: recipientId,
+                      shared_by: user.id,
+                      encrypted_symmetric_key: reEncryptedKey,
+                      permission: 'read',
+                      shared_at: new Date().toISOString(),
+                    });
+                  })
+                );
+              }
+            } catch (err: any) {
+              console.warn(
+                '[Vault] updateItem: failed to re-wrap shares for item',
+                target.id,
+                err?.message || err
+              );
             }
-          : item
-      );
-      setItems(updated);
-      await AsyncStorage.setItem(`clickrypt_cached_vault_${appMode}`, JSON.stringify(updated));
+          }
 
-      const folderName = targetFolderId
-        ? folders.find((f) => f.id === targetFolderId)?.name || 'Folder'
-        : 'Root Vault (No Folder)';
+          try {
+            const { error } = await supabase.from('resources').upsert({
+              id: target.id,
+              mode: appMode,
+              owner_id: target.ownerId || user.id,
+              folder_id: target.folderId ?? null,
+              data: persistableItem(target),
+            });
+            if (error) throw error;
+          } catch {
+            await queueMutation({
+              action: 'UPSERT_RESOURCE',
+              table: 'resources',
+              recordId: target.id,
+              columns: {
+                owner_id: target.ownerId || user.id,
+                folder_id: target.folderId ?? null,
+              },
+              data: persistableItem(target),
+            });
+          }
+        }
 
-      await logActivity(
-        user.id,
-        user.email,
-        'Bulk Moved to Folder',
-        `Moved ${itemIds.length} item(s) to "${folderName}"`,
-        'folder',
-        appMode
-      );
+        invalidateVaultCache();
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    [appMode, invalidateVaultCache, items, user]
+  );
 
-      for (const id of itemIds) {
+  const batchMoveToFolder = useCallback(
+    async (itemIds: string[], targetFolderId: string | null) => {
+      try {
+        if (!user) return false;
+
+        const updated = items.map((item) =>
+          itemIds.includes(item.id)
+            ? ({
+                ...item,
+                folderId: targetFolderId,
+                lastModified: new Date().toLocaleDateString('en-US', {
+                  month: 'short',
+                  day: 'numeric',
+                  year: 'numeric',
+                  hour: '2-digit',
+                  minute: '2-digit',
+                }),
+              } as VaultItem)
+            : item
+        );
+        setItems(updated);
+        await AsyncStorage.setItem(
+          `clickrypt_cached_vault_${appMode}`,
+          JSON.stringify(updated)
+        );
+
+        const folderName = targetFolderId
+          ? folders.find((f) => f.id === targetFolderId)?.name || 'Folder'
+          : 'Root Vault (No Folder)';
+
+        await logActivity(
+          user.id,
+          user.email,
+          'Bulk Moved to Folder',
+          `Moved ${itemIds.length} item(s) to "${folderName}"`,
+          'folder',
+          appMode
+        );
+
+        for (const id of itemIds) {
+          const target = updated.find((i) => i.id === id);
+          if (target) {
+            try {
+              await supabase.from('resources').upsert({
+                id: target.id,
+                mode: appMode,
+                owner_id: target.ownerId || user.id,
+                folder_id: target.folderId ?? null,
+                data: persistableItem(target),
+              });
+            } catch {
+              await queueMutation({
+                action: 'UPSERT_RESOURCE',
+                table: 'resources',
+                recordId: target.id,
+                columns: {
+                  owner_id: target.ownerId || user.id,
+                  folder_id: target.folderId ?? null,
+                },
+                data: persistableItem(target),
+              });
+            }
+          }
+        }
+
+        invalidateVaultCache();
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    [appMode, folders, invalidateVaultCache, items, user]
+  );
+
+  const deleteItem = useCallback(
+    async (id: string) => {
+      try {
+        if (!user) return false;
+
+        const itemToDelete = items.find((i) => i.id === id);
+        const updated = items.map((i) =>
+          i.id === id
+            ? ({ ...i, isDeleted: true, deletedAt: new Date().toISOString() } as VaultItem)
+            : i
+        );
+        setItems(updated);
+        await AsyncStorage.setItem(
+          `clickrypt_cached_vault_${appMode}`,
+          JSON.stringify(updated)
+        );
+
+        if (itemToDelete) {
+          await logActivity(
+            user.id,
+            user.email,
+            'Moved to Trash',
+            `Moved "${itemToDelete.name}" to Trash / Recycle Bin`,
+            'vault',
+            appMode
+          );
+        }
+
         const target = updated.find((i) => i.id === id);
         if (target) {
           try {
             await supabase.from('resources').upsert({
               id: target.id,
               mode: appMode,
-              data: { ...target },
+              owner_id: target.ownerId || user.id,
+              folder_id: target.folderId ?? null,
+              data: persistableItem(target),
             });
           } catch {
             await queueMutation({
               action: 'UPSERT_RESOURCE',
               table: 'resources',
               recordId: target.id,
-              data: { ...target },
+              columns: {
+                owner_id: target.ownerId || user.id,
+                folder_id: target.folderId ?? null,
+              },
+              data: persistableItem(target),
             });
           }
         }
-      }
-      return true;
-    } catch {
-      return false;
-    }
-  };
 
-  const deleteItem = async (id: string) => {
-    try {
-      if (!user) return false;
-      const itemToDelete = items.find((i) => i.id === id);
-      const updated = items.map((i) =>
-        i.id === id ? { ...i, isDeleted: true, deletedAt: new Date().toISOString() } : i
-      );
-      setItems(updated);
-      await AsyncStorage.setItem(`clickrypt_cached_vault_${appMode}`, JSON.stringify(updated));
-
-      if (itemToDelete) {
-        await logActivity(
-          user.id,
-          user.email,
-          'Moved to Trash',
-          `Moved "${itemToDelete.name}" to Trash / Recycle Bin`,
-          'vault',
-          appMode
-        );
-      }
-
-      const target = updated.find((i) => i.id === id);
-      if (target) {
-        try {
-          await supabase.from('resources').upsert({
-            id: target.id,
-            mode: appMode,
-            data: { ...target },
-          });
-        } catch {
-          await queueMutation({
-            action: 'UPSERT_RESOURCE',
-            table: 'resources',
-            recordId: target.id,
-            data: { ...target },
-          });
-        }
-      }
-
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
-  const restoreItem = async (id: string) => {
-    try {
-      if (!user) return false;
-      const itemToRestore = items.find((i) => i.id === id);
-      const updated = items.map((i) =>
-        i.id === id ? { ...i, isDeleted: false, deletedAt: undefined } : i
-      );
-      setItems(updated);
-      await AsyncStorage.setItem(`clickrypt_cached_vault_${appMode}`, JSON.stringify(updated));
-
-      if (itemToRestore) {
-        await logActivity(
-          user.id,
-          user.email,
-          'Restored from Trash',
-          `Restored "${itemToRestore.name}" from trash`,
-          'vault',
-          appMode
-        );
-      }
-
-      const target = updated.find((i) => i.id === id);
-      if (target) {
-        try {
-          await supabase.from('resources').upsert({
-            id: target.id,
-            mode: appMode,
-            data: { ...target },
-          });
-        } catch {
-          await queueMutation({
-            action: 'UPSERT_RESOURCE',
-            table: 'resources',
-            recordId: target.id,
-            data: { ...target },
-          });
-        }
-      }
-
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
-  const purgeItem = async (id: string) => {
-    try {
-      if (!user) return false;
-      const itemToPurge = items.find((i) => i.id === id);
-      const filtered = items.filter((i) => i.id !== id);
-      setItems(filtered);
-      await AsyncStorage.setItem(`clickrypt_cached_vault_${appMode}`, JSON.stringify(filtered));
-
-      if (itemToPurge) {
-        await logActivity(
-          user.id,
-          user.email,
-          'Permanently Deleted',
-          `Permanently deleted "${itemToPurge.name}" from trash`,
-          'vault',
-          appMode
-        );
-      }
-
-      try {
-        const { error } = await supabase.from('resources').delete().eq('id', id);
-        if (error) throw error;
+        invalidateVaultCache();
+        return true;
       } catch {
-        await queueMutation({
-          action: 'DELETE_RESOURCE',
-          table: 'resources',
-          recordId: id,
-        });
+        return false;
       }
+    },
+    [appMode, invalidateVaultCache, items, user]
+  );
 
-      return true;
-    } catch {
-      return false;
-    }
-  };
+  const restoreItem = useCallback(
+    async (id: string) => {
+      try {
+        if (!user) return false;
 
-  const emptyTrash = async () => {
+        const itemToRestore = items.find((i) => i.id === id);
+        const updated = items.map((i) =>
+          i.id === id
+            ? ({ ...i, isDeleted: false, deletedAt: undefined } as VaultItem)
+            : i
+        );
+        setItems(updated);
+        await AsyncStorage.setItem(
+          `clickrypt_cached_vault_${appMode}`,
+          JSON.stringify(updated)
+        );
+
+        if (itemToRestore) {
+          await logActivity(
+            user.id,
+            user.email,
+            'Restored from Trash',
+            `Restored "${itemToRestore.name}" from trash`,
+            'vault',
+            appMode
+          );
+        }
+
+        const target = updated.find((i) => i.id === id);
+        if (target) {
+          try {
+            await supabase.from('resources').upsert({
+              id: target.id,
+              mode: appMode,
+              owner_id: target.ownerId || user.id,
+              folder_id: target.folderId ?? null,
+              data: persistableItem(target),
+            });
+          } catch {
+            await queueMutation({
+              action: 'UPSERT_RESOURCE',
+              table: 'resources',
+              recordId: target.id,
+              columns: {
+                owner_id: target.ownerId || user.id,
+                folder_id: target.folderId ?? null,
+              },
+              data: persistableItem(target),
+            });
+          }
+        }
+
+        invalidateVaultCache();
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    [appMode, invalidateVaultCache, items, user]
+  );
+
+  const purgeItem = useCallback(
+    async (id: string) => {
+      try {
+        if (!user) return false;
+
+        const itemToPurge = items.find((i) => i.id === id);
+        const filtered = items.filter((i) => i.id !== id);
+        setItems(filtered);
+        await AsyncStorage.setItem(
+          `clickrypt_cached_vault_${appMode}`,
+          JSON.stringify(filtered)
+        );
+
+        if (itemToPurge) {
+          await logActivity(
+            user.id,
+            user.email,
+            'Permanently Deleted',
+            `Permanently deleted "${itemToPurge.name}" from trash`,
+            'vault',
+            appMode
+          );
+        }
+
+        try {
+          const { error } = await supabase.from('resources').delete().eq('id', id);
+          if (error) throw error;
+        } catch {
+          await queueMutation({
+            action: 'DELETE_RESOURCE',
+            table: 'resources',
+            recordId: id,
+          });
+        }
+
+        invalidateVaultCache();
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    [appMode, invalidateVaultCache, items, user]
+  );
+
+  const emptyTrash = useCallback(async () => {
     try {
       if (!user) return false;
+
       const deletedItems = items.filter((i) => i.isDeleted);
       const activeOnly = items.filter((i) => !i.isDeleted);
       setItems(activeOnly);
-      await AsyncStorage.setItem(`clickrypt_cached_vault_${appMode}`, JSON.stringify(activeOnly));
+      await AsyncStorage.setItem(
+        `clickrypt_cached_vault_${appMode}`,
+        JSON.stringify(activeOnly)
+      );
 
       await logActivity(
         user.id,
@@ -719,21 +1078,26 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
           });
         }
       }
+
+      invalidateVaultCache();
       return true;
     } catch {
       return false;
     }
-  };
+  }, [appMode, invalidateVaultCache, items, user]);
 
-  const revealPassword = async (item: VaultItem): Promise<string> => {
-    if (!user) return '';
+  const revealPassword = useCallback(
+    async (item: VaultItem) => {
+      if (!user) {
+        console.warn('[Vault] revealPassword: no user');
+        throw new DecryptionFailedError('No authenticated user available to decrypt this item.');
+      }
 
-    // Helper to log and cache decrypted password in state without mutating item in-place
-    const commitDecrypted = async (val: string) => {
-      setItems((prev) =>
-        prev.map((i) => (i.id === item.id ? { ...i, decryptedPassword: val } : i))
-      );
-      try {
+      const commitDecrypted = async (val: string) => {
+        const next = items.map((i) =>
+          i.id === item.id ? { ...i, decryptedPassword: val } : i
+        );
+        setItems(next);
         logActivity(
           user.id,
           user.email,
@@ -742,235 +1106,442 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
           'vault',
           appMode
         ).catch(() => {});
-      } catch {
-        // ignore
-      }
-      return val;
-    };
+        return val;
+      };
 
-    // 1. Direct memory/stored decrypted password if present, clean, and valid
-    if (
-      item.decryptedPassword &&
-      !isEncryptedCipher(item.decryptedPassword) &&
-      item.decryptedPassword !== '•••••••' &&
-      item.decryptedPassword !== '••••••••'
-    ) {
-      return commitDecrypted(item.decryptedPassword);
-    }
-
-    const activeKey = unlockedPgpKey || (await AsyncStorage.getItem('clickrypt_unlocked_pgp_key'));
-    const activePass = masterPassword || (await AsyncStorage.getItem('clickrypt_master_password'));
-
-    // 2. Try decrypting from secrets array using canonical secret resolver
-    const userSecret = resolveBestSecret(item, user.id, user.role, user.email);
-    const rawBlob =
-      userSecret?.encryptedData ||
-      (item.decryptedPassword && isEncryptedCipher(item.decryptedPassword) ? item.decryptedPassword : null) ||
-      item.secrets?.find((s) => s.userId === user.id)?.encryptedData ||
-      item.secrets?.[0]?.encryptedData ||
-      (item as any).secrets?.[0]?.encrypted_data ||
-      (item as any).encryptedData ||
-      (item as any).encryptedPassword ||
-      (item as any).data?.encryptedPassword ||
-      (item as any).data?.password ||
-      (item as any).password;
-
-    if (rawBlob && typeof rawBlob === 'string') {
-      try {
-        const decrypted = await decryptSecret(
-          rawBlob,
-          activeKey || user.encryptedPrivateKey,
-          activePass || undefined
-        );
-
-        if (
-          decrypted &&
-          decrypted.trim() &&
-          !isEncryptedCipher(decrypted) &&
-          decrypted !== '•••••••' &&
-          decrypted !== '••••••••'
-        ) {
-          return await commitDecrypted(decrypted);
-        }
-      } catch {
-        // continue
-      }
-    }
-
-    // 3. Try decrypting from resource_shares if shared with user
-    try {
-      const { data: shareData } = await supabase
-        .from('resource_shares')
-        .select('*')
-        .eq('resource_id', item.id)
-        .eq('recipient_id', user.id)
-        .maybeSingle();
-
-      if (shareData?.encrypted_symmetric_key) {
-        const decryptedSymKey = await decryptWithPrivateKey(
-          shareData.encrypted_symmetric_key,
-          unlockedPgpKey || user.encryptedPrivateKey,
-          masterPassword || undefined
-        );
-        const decrypted = rawBlob
-          ? await decryptSecret(rawBlob, decryptedSymKey, masterPassword || undefined)
-          : decryptedSymKey;
-
-        if (
-          decrypted &&
-          decrypted.trim() &&
-          !isEncryptedCipher(decrypted) &&
-          decrypted !== '•••••••' &&
-          decrypted !== '••••••••'
-        ) {
-          return await commitDecrypted(decrypted);
-        }
-      }
-    } catch {
-      // continue
-    }
-
-    // 4. If note content exists, return it
-    if (item.noteContent && !isEncryptedCipher(item.noteContent)) {
-      return await commitDecrypted(item.noteContent);
-    }
-
-    if (item.decryptedPassword && !isEncryptedCipher(item.decryptedPassword)) {
-      return item.decryptedPassword;
-    }
-
-    const fallbackVal =
-      (item as any).password ||
-      (item as any).data?.password ||
-      item.decryptedPassword ||
-      '';
-    return await commitDecrypted(fallbackVal);
-  };
-
-  const shareItemWithMember = async (
-    itemId: string,
-    member: { id: string; name: string; email: string }
-  ): Promise<boolean> => {
-    try {
-      if (!user) return false;
-      const target = items.find((i) => i.id === itemId);
-      if (!target) return false;
-
-      // 1. Fetch recipient's RSA public key from database
-      const { data: recipientProfile } = await supabase
-        .from('users')
-        .select('*')
-        .eq('id', member.id)
-        .maybeSingle();
-
-      const recipientPubKey =
-        recipientProfile?.public_key ||
-        recipientProfile?.data?.publicKey ||
-        (member as any).publicKey;
-
-      // 2. Generate or extract symmetric key, and re-encrypt with recipient's public key
-      const revealedSecret = await revealPassword(target);
-      const reEncryptedKey = await encryptWithPublicKey(revealedSecret, recipientPubKey);
-
-      // 3. Upsert into resource_shares table (Zero-Knowledge Asymmetric Share)
-      try {
-        await supabase.from('resource_shares').upsert({
-          id: `sh-${target.id}-${member.id}`,
-          resource_id: target.id,
-          recipient_id: member.id,
-          encrypted_symmetric_key: reEncryptedKey,
-          shared_by: user.id,
-          permission: 'read',
-          shared_at: new Date().toISOString(),
-        });
-      } catch {
-        // queued if offline
+      if (
+        item.decryptedPassword &&
+        !isEncryptedCipher(item.decryptedPassword) &&
+        item.decryptedPassword !== '•••••••' &&
+        item.decryptedPassword !== '••••••••'
+      ) {
+        return commitDecrypted(item.decryptedPassword);
       }
 
-      const currentShared = target.sharedWith || [];
-      const updatedShared = currentShared.includes(member.id)
-        ? currentShared
-        : [...currentShared, member.id];
+      const activeKey =
+        unlockedPgpKey ||
+        (await AsyncStorage.getItem('clickrypt_unlocked_pgp_key'));
+      const activePass =
+        masterPassword ||
+        (await AsyncStorage.getItem('clickrypt_master_password'));
 
-      const currentMembers = target.sharedWithMembers || [];
-      const existingMember = currentMembers.find((m) => m.id === member.id);
-      const updatedMembers = existingMember
-        ? currentMembers
-        : [
-            ...currentMembers,
-            {
-              id: member.id,
-              name: member.name,
-              email: member.email,
-              sharedAt: new Date().toLocaleDateString(),
-            },
-          ];
+      const hasKey = isDecryptionKeyAvailable(activeKey, activePass, user.encryptedPrivateKey);
+      if (!hasKey) {
+        console.warn('[Vault] revealPassword: no decryption key available for item', item.id);
+        throw new VaultLockedError();
+      }
 
-      await logActivity(
+      const userSecretPreview = resolveBestSecret(item, user.id, user.role, user.email);
+      console.log(`[Vault] revealPassword start: item=${item.id}, hasEncryptedSymmetricKey=${!!item.encryptedSymmetricKey}, hasRawBlob=${!!userSecretPreview?.encryptedData}, activeKey=${!!activeKey}, activePass=${!!activePass}`);
+
+      const userSecret = resolveBestSecret(
+        item,
         user.id,
-        user.email,
-        'Item Shared with Team',
-        `Shared "${target.name}" with ${member.name} (${member.email})`,
-        'share',
-        appMode
+        user.role,
+        user.email
       );
+      const rawBlob: any =
+        userSecret?.encryptedData ||
+        (item.decryptedPassword &&
+        isEncryptedCipher(item.decryptedPassword)
+          ? item.decryptedPassword
+          : null) ||
+        item.secrets?.find((s) => s.userId === user.id)?.encryptedData ||
+        item.secrets?.[0]?.encryptedData ||
+        (item as any).secrets?.[0]?.encrypted_data ||
+        (item as any).encryptedData ||
+        (item as any).encryptedPassword ||
+        (item as any).data?.encryptedPassword ||
+        (item as any).data?.password ||
+        (item as any).password;
 
-      return await updateItem(itemId, {
-        sharedWith: updatedShared,
-        sharedWithMembers: updatedMembers,
-        isExternalShared: true,
-      });
-    } catch {
-      return false;
-    }
-  };
+      const encSymKey: any =
+        item.encryptedSymmetricKey ||
+        (item as any).encrypted_symmetric_key ||
+        (item as any).data?.encryptedSymmetricKey;
 
-  const revokeSharing = async (itemId: string, memberId?: string): Promise<boolean> => {
-    try {
-      if (!user) return false;
-      const target = items.find((i) => i.id === itemId);
-      if (!target) return false;
-
-      // Delete from resource_shares table
-      try {
-        if (memberId) {
-          await supabase
-            .from('resource_shares')
-            .delete()
-            .eq('resource_id', itemId)
-            .eq('recipient_id', memberId);
-        } else {
-          await supabase
-            .from('resource_shares')
-            .delete()
-            .eq('resource_id', itemId);
+      if (encSymKey && (activeKey || activePass)) {
+        try {
+          const unwrappedKey = await decryptWithPrivateKey(
+            encSymKey,
+            activeKey || user.encryptedPrivateKey,
+            activePass || undefined
+          );
+          if (unwrappedKey && rawBlob) {
+            // unwrappedKey is a symmetric key string, not a PGP key, so it
+            // must be passed as the passphrase argument of decryptSecret.
+            const decrypted = await decryptSecret(rawBlob, undefined, unwrappedKey);
+            if (
+              decrypted &&
+              decrypted.trim() &&
+              !isEncryptedCipher(decrypted) &&
+              decrypted !== '•••••••' &&
+              decrypted !== '••••••••'
+            ) {
+              console.log(`[Vault] revealPassword symmetric branch succeeded for item ${item.id}`);
+              return await commitDecrypted(decrypted);
+            }
+            console.warn(`[Vault] revealPassword symmetric branch returned undecryptable result for item ${item.id}`);
+          }
+        } catch (err: any) {
+          console.warn(`[Vault] revealPassword symmetric branch failed for item ${item.id}:`, err?.message || err);
         }
-      } catch {
-        // ignore
       }
 
-      if (memberId) {
-        const updatedShared = (target.sharedWith || []).filter((id) => id !== memberId);
-        const updatedMembers = (target.sharedWithMembers || []).filter((m) => m.id !== memberId);
+      try {
+        const { data: shareData } = await withTimeout(
+          supabase
+            .from('resource_shares')
+            .select('*')
+            .eq('resource_id', item.id)
+            .eq('recipient_id', user.id)
+            .maybeSingle(),
+          10000,
+          'revealPassword resource_shares lookup'
+        );
+
+        if (shareData?.encrypted_symmetric_key) {
+          const decryptedSymKey = await decryptWithPrivateKey(
+            shareData.encrypted_symmetric_key,
+            activeKey || user.encryptedPrivateKey,
+            activePass || undefined
+          );
+          const decrypted = rawBlob
+            ? await decryptSecret(rawBlob, undefined, decryptedSymKey)
+            : decryptedSymKey;
+
+          if (
+            decrypted &&
+            decrypted.trim() &&
+            !isEncryptedCipher(decrypted) &&
+            decrypted !== '•••••••' &&
+            decrypted !== '••••••••'
+          ) {
+            console.log(`[Vault] revealPassword resource_share branch succeeded for item ${item.id}`);
+            return await commitDecrypted(decrypted);
+          }
+          console.warn(`[Vault] revealPassword resource_share branch returned undecryptable result for item ${item.id}`);
+        }
+      } catch (err: any) {
+        console.warn(`[Vault] revealPassword resource_share branch failed for item ${item.id}:`, err?.message || err);
+      }
+
+      if (rawBlob && typeof rawBlob === 'string') {
+        try {
+          const decrypted = await decryptSecret(
+            rawBlob,
+            activeKey || user.encryptedPrivateKey,
+            activePass || undefined
+          );
+
+          if (
+            decrypted &&
+            decrypted.trim() &&
+            !isEncryptedCipher(decrypted) &&
+            decrypted !== '•••••••' &&
+            decrypted !== '••••••••'
+          ) {
+            console.log(`[Vault] revealPassword direct-PGP branch succeeded for item ${item.id}`);
+            return await commitDecrypted(decrypted);
+          }
+          console.warn(`[Vault] revealPassword direct-PGP branch returned undecryptable result for item ${item.id}`);
+        } catch (err: any) {
+          console.warn(`[Vault] revealPassword direct-PGP branch failed for item ${item.id}:`, err?.message || err);
+        }
+      }
+
+      if (item.noteContent && !isEncryptedCipher(item.noteContent)) {
+        return await commitDecrypted(item.noteContent);
+      }
+
+      if (item.decryptedPassword && !isEncryptedCipher(item.decryptedPassword)) {
+        return item.decryptedPassword;
+      }
+
+      // Legacy plaintext recovery: check all possible fields where plaintext
+      // may have been stored by older versions of the app (before the
+      // persistableItem fix stripped password/noteContent from the DB payload).
+      const fallbackVal: any =
+        (item as any).password ||
+        (item as any).data?.password ||
+        (item as any).data?.decryptedPassword ||
+        (item as any).data?.noteContent ||
+        (item as any).data?.secret ||
+        (item as any).secret ||
+        item.decryptedPassword ||
+        '';
+
+      if (fallbackVal && typeof fallbackVal === 'string' && !isEncryptedCipher(fallbackVal) &&
+          fallbackVal !== '•••••••' && fallbackVal !== '••••••••') {
+        console.log(`[Vault] revealPassword fallback branch succeeded for item ${item.id}`);
+        const result = await commitDecrypted(fallbackVal);
+
+        // Auto-re-encrypt: migrate the recovered plaintext to the proper
+        // symmetric+PGP scheme so future reveals use the normal path and the
+        // item is no longer dependent on the legacy plaintext fallback.
+        if (user.publicKey && (activeKey || activePass)) {
+          try {
+            const itemSymmetricKey = generateSymmetricKey();
+            const newBlob = await encryptSecret(fallbackVal, itemSymmetricKey);
+            const newWrappedKey = await encryptWithPublicKey(
+              itemSymmetricKey,
+              user.publicKey
+            );
+            if (newBlob && newWrappedKey &&
+                newBlob.includes('-----BEGIN PGP MESSAGE-----') &&
+                newWrappedKey.includes('-----BEGIN PGP MESSAGE-----')) {
+              const updated = items.map((i) =>
+                i.id === item.id
+                  ? {
+                      ...i,
+                      secrets: [{ userId: user.id, encryptedData: newBlob }],
+                      encryptedSymmetricKey: newWrappedKey,
+                      decryptedPassword: fallbackVal,
+                    }
+                  : i
+              );
+              setItems(updated);
+              await AsyncStorage.setItem(
+                `clickrypt_cached_vault_${appMode}`,
+                JSON.stringify(updated)
+              );
+              try {
+                await withTimeout(
+                  supabase.from('resources').upsert({
+                    id: item.id,
+                    mode: appMode,
+                    owner_id: item.ownerId || user.id,
+                    folder_id: item.folderId ?? null,
+                    data: persistableItem(
+                      updated.find((i) => i.id === item.id) as VaultItem
+                    ),
+                  }),
+                  15000,
+                  'revealPassword auto-re-encrypt upsert'
+                );
+                console.log(`[Vault] revealPassword: auto-re-encrypted item ${item.id} migrated to proper scheme`);
+              } catch (err: any) {
+                console.warn(`[Vault] revealPassword: auto-re-encrypt DB persist failed for item ${item.id}:`, err?.message || err);
+              }
+            }
+          } catch (err: any) {
+            console.warn(`[Vault] revealPassword: auto-re-encrypt failed for item ${item.id}:`, err?.message || err);
+          }
+        }
+
+        return result;
+      }
+
+      console.warn(`[Vault] revealPassword: all branches exhausted for item ${item.id}`);
+      throw new DecryptionFailedError(
+        'Unable to decrypt this item. The stored secret may be damaged or the encryption key does not match.'
+      );
+    },
+    [appMode, items, masterPassword, unlockedPgpKey, user]
+  );
+
+  const shareItemWithMember = useCallback(
+    async (
+      itemId: string,
+      member: { id: string; name: string; email: string }
+    ) => {
+      try {
+        if (!user) return false;
+
+        const target = items.find((i) => i.id === itemId);
+        if (!target) return false;
+
+        const { data: recipientProfile } = await supabase
+          .from('users')
+          .select('*')
+          .eq('id', member.id)
+          .maybeSingle();
+
+        const recipientPubKey: any =
+          recipientProfile?.public_key ||
+          recipientProfile?.data?.publicKey ||
+          (member as any).publicKey;
+
+        if (!recipientPubKey) {
+          console.warn('[Vault] shareItemWithMember: recipient has no public key', member.id);
+          return false;
+        }
+
+        // To unwrap the owner's key we need the owner's private key available.
+        const activeKey =
+          unlockedPgpKey ||
+          (await AsyncStorage.getItem('clickrypt_unlocked_pgp_key'));
+        const activePass =
+          masterPassword ||
+          (await AsyncStorage.getItem('clickrypt_master_password'));
+
+        if (!isDecryptionKeyAvailable(activeKey, activePass, user.encryptedPrivateKey)) {
+          console.warn('[Vault] shareItemWithMember: no decryption key available for item', target.id);
+          return false;
+        }
+
+        let reEncryptedKey = '';
+
+        // Prefer the modern scheme: the item stores a wrapped copy of the actual
+        // symmetric key for the owner, and we re-wrap that same key for the
+        // recipient. This matches how revealPassword consumes resource_shares.
+        if (target.encryptedSymmetricKey && isEncryptedCipher(target.encryptedSymmetricKey)) {
+          try {
+            const itemSymmetricKey = await decryptWithPrivateKey(
+              target.encryptedSymmetricKey,
+              activeKey || user.encryptedPrivateKey,
+              activePass || undefined
+            );
+            if (itemSymmetricKey && !isEncryptedCipher(itemSymmetricKey)) {
+              reEncryptedKey = await encryptWithPublicKey(
+                itemSymmetricKey,
+                recipientPubKey
+              );
+            }
+          } catch (err: any) {
+            console.warn(
+              '[Vault] shareItemWithMember: failed to unwrap item symmetric key, falling back',
+              target.id,
+              err?.message || err
+            );
+          }
+        }
+
+        // Legacy fallback for items created before the symmetric-key scheme:
+        // encrypt the plaintext secret directly with the recipient's public key.
+        // This is what the previous implementation did and is not decryptable
+        // by the modern reveal path, but it preserves existing behavior for old
+        // data until the item is re-encrypted.
+        if (!reEncryptedKey) {
+          console.warn(
+            '[Vault] shareItemWithMember: item has no wrapped symmetric key; sharing as legacy encrypted-secret',
+            target.id
+          );
+          const revealedSecret = await revealPassword(target);
+          if (!revealedSecret) return false;
+          reEncryptedKey = await encryptWithPublicKey(
+            revealedSecret,
+            recipientPubKey
+          );
+        }
+
+        try {
+          await supabase.from('resource_shares').upsert({
+            id: `sh-${target.id}-${member.id}`,
+            resource_id: target.id,
+            recipient_id: member.id,
+            encrypted_symmetric_key: reEncryptedKey,
+            shared_by: user.id,
+            permission: 'read',
+            shared_at: new Date().toISOString(),
+          });
+        } catch {
+          // queued if offline
+        }
+
+        const currentShared = target.sharedWith || [];
+        const updatedShared = currentShared.includes(member.id)
+          ? currentShared
+          : [...currentShared, member.id];
+
+        const currentMembers = target.sharedWithMembers || [];
+        const existingMember = currentMembers.find((m) => m.id === member.id);
+        const updatedMembers = existingMember
+          ? currentMembers
+          : [
+              ...currentMembers,
+              {
+                id: member.id,
+                name: member.name,
+                email: member.email,
+                sharedAt: new Date().toLocaleDateString(),
+              } as any,
+            ];
+
+        await logActivity(
+          user.id,
+          user.email,
+          'Item Shared with Team',
+          `Shared "${target.name}" with ${member.name} (${member.email})`,
+          'share',
+          appMode
+        );
+
         return await updateItem(itemId, {
           sharedWith: updatedShared,
-          sharedWithMembers: updatedMembers,
-          isExternalShared: updatedShared.length > 0,
+          sharedWithMembers: updatedMembers as any,
+          isExternalShared: true,
         });
-      } else {
-        // Revoke all shares
-        return await updateItem(itemId, {
-          sharedWith: [],
-          sharedWithMembers: [],
-          isExternalShared: false,
-        });
+      } catch {
+        return false;
       }
-    } catch {
-      return false;
-    }
-  };
+    },
+    [appMode, items, masterPassword, revealPassword, unlockedPgpKey, updateItem, user]
+  );
 
-  const checkAllBreaches = async (): Promise<{ checked: number; breached: number }> => {
+  const revokeSharing = useCallback(
+    async (itemId: string, memberId?: string) => {
+      try {
+        if (!user) return false;
+
+        const target = items.find((i) => i.id === itemId);
+        if (!target) return false;
+
+        try {
+          if (memberId) {
+            await supabase
+              .from('resource_shares')
+              .delete()
+              .eq('resource_id', itemId)
+              .eq('recipient_id', memberId);
+          } else {
+            await supabase
+              .from('resource_shares')
+              .delete()
+              .eq('resource_id', itemId);
+          }
+        } catch {
+          // ignore
+        }
+
+        if (memberId) {
+          const updatedShared = (target.sharedWith || []).filter(
+            (id) => id !== memberId
+          );
+          const updatedMembers = (target.sharedWithMembers || []).filter(
+            (m) => m.id !== memberId
+          );
+          return await updateItem(itemId, {
+            sharedWith: updatedShared,
+            sharedWithMembers: updatedMembers as any,
+            isExternalShared: updatedShared.length > 0,
+          });
+        } else {
+          return await updateItem(itemId, {
+            sharedWith: [],
+            sharedWithMembers: [],
+            isExternalShared: false,
+          });
+        }
+      } catch {
+        return false;
+      }
+    },
+    [items, updateItem, user]
+  );
+
+  const refreshVault = useCallback(async () => {
+    if (!user) {
+      const cached = await loadCachedVault(appMode);
+      setItems(cached);
+      setRawItems(cached);
+      return;
+    }
+    await fetchVaultData(true);
+  }, [appMode, fetchVaultData, user]);
+
+  const checkAllBreaches = useCallback(async () => {
+    if (!user) return { checked: 0, breached: 0 };
     let breached = 0;
     const updatedItems = [...items];
 
@@ -981,55 +1552,61 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
       const res = await checkPasswordBreach(secret);
       if (res.isBreached) {
         breached++;
-        updatedItems[i] = { ...item, isLeaked: true, score: 20, strength: 'Weak' };
+        updatedItems[i] = {
+          ...item,
+          isLeaked: true,
+          score: 20,
+          strength: 'Weak',
+        } as VaultItem;
       }
     }
 
     setItems(updatedItems);
-    await AsyncStorage.setItem(`clickrypt_cached_vault_${appMode}`, JSON.stringify(updatedItems));
+    await AsyncStorage.setItem(
+      `clickrypt_cached_vault_${appMode}`,
+      JSON.stringify(updatedItems)
+    );
     return { checked: items.length, breached };
+  }, [appMode, items, revealPassword, user]);
+
+  const value: VaultContextType = {
+    items,
+    folders,
+    isLoading,
+    isSyncing,
+    filterMode,
+    setFilterMode,
+    selectedFolderId,
+    setSelectedFolderId,
+    searchQuery,
+    setSearchQuery,
+    activeTab,
+    setActiveTab,
+    isFilterOpen,
+    setIsFilterOpen,
+    isFolderDropdownOpen,
+    setIsFolderDropdownOpen,
+    createItem,
+    updateItem,
+    batchMoveToFolder,
+    deleteItem,
+    restoreItem,
+    purgeItem,
+    emptyTrash,
+    shareItemWithMember,
+    revokeSharing,
+    revealPassword,
+    refreshVault,
+    checkAllBreaches,
   };
 
   return (
-    <VaultContext.Provider
-      value={{
-        items,
-        folders,
-        isLoading,
-        isSyncing,
-        filterMode,
-        setFilterMode,
-        selectedFolderId,
-        setSelectedFolderId,
-        searchQuery,
-        setSearchQuery,
-        activeTab,
-        setActiveTab,
-        isFilterOpen,
-        setIsFilterOpen,
-        isFolderDropdownOpen,
-        setIsFolderDropdownOpen,
-        createItem,
-        updateItem,
-        batchMoveToFolder,
-        deleteItem,
-        restoreItem,
-        purgeItem,
-        emptyTrash,
-        shareItemWithMember,
-        revokeSharing,
-        revealPassword,
-        refreshVault: () => fetchVaultData(true),
-        checkAllBreaches,
-      }}
-    >
-      {children}
-    </VaultContext.Provider>
+    <VaultContext.Provider value={value}>{children}</VaultContext.Provider>
   );
 };
 
-export const useVault = () => {
-  const context = useContext(VaultContext);
-  if (!context) throw new Error('useVault must be used within VaultProvider');
-  return context;
+export const useVault = (): VaultContextType => {
+  const ctx = useContext(VaultContext);
+  if (!ctx) throw new Error('useVault must be used inside VaultProvider');
+  return ctx;
 };

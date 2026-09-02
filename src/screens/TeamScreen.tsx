@@ -53,6 +53,7 @@ interface GroupItem {
   folderIds?: string[];
   assignedFolderIds?: string[];
   assignedResourceIds?: string[];
+  createdBy?: string;
   memberCount?: number;
   lastActive?: string;
 }
@@ -60,7 +61,7 @@ interface GroupItem {
 export const TeamScreen = () => {
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
-  const { appMode } = useAuth();
+  const { appMode, user } = useAuth();
   const { items, folders, deleteItem, refreshVault } = useVault();
 
   // Root subTab
@@ -180,6 +181,7 @@ export const TeamScreen = () => {
               description: g.description || g.data?.description || 'Organization access group',
               memberIds: finalMemberIds,
               folderIds: finalFolderIds,
+              createdBy: g.created_by,
               memberCount: finalMemberIds.length,
               lastActive: g.data?.lastActive || 'Active today',
             };
@@ -258,6 +260,7 @@ export const TeamScreen = () => {
       memberIds: currentMemberIds,
       folderIds: [],
       memberCount: currentMemberIds.length,
+      createdBy: user?.id,
       lastActive: 'Just now',
     };
 
@@ -268,6 +271,7 @@ export const TeamScreen = () => {
         id: newGroup.id,
         name: newGroup.name,
         description: newGroup.description,
+        created_by: user?.id,
         data: newGroup,
       });
 

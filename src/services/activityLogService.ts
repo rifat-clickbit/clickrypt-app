@@ -1,6 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from './supabaseClient';
+import { withTimeout } from '../utils/withTimeout';
 
 export type ActivityCategory =
   | 'auth'
@@ -34,14 +35,39 @@ export const getActivityLogs = async (
   const identifier = userId || (email ? email.trim().toLowerCase() : 'default');
   const key = `${STORAGE_PREFIX}${identifier}`;
   try {
-    // 1. Try fetching from Supabase activity_logs
+    // 1. Try fetching from cached edge function
+    const { data: sessionData } = await withTimeout(
+      supabase.auth.getSession(),
+      10000,
+      'getActivityLogs getSession'
+    );
+    if (sessionData.session?.user) {
+      const { data, error } = await withTimeout(
+        supabase.functions.invoke('activity-log-cache', {
+          body: {},
+        }),
+        10000,
+        'getActivityLogs activity-log-cache'
+      );
+      if (!error && data?.logs) {
+        const logs = data.logs as ActivityLogItem[];
+        await AsyncStorage.setItem(key, JSON.stringify(logs));
+        return logs;
+      }
+    }
+
+    // 2. Try fetching from Supabase directly
     if (userId) {
-      const { data: dbLogs } = await supabase
-        .from('activity_logs')
-        .select('*')
-        .eq('user_id', userId)
-        .order('timestamp', { ascending: false })
-        .limit(50);
+      const { data: dbLogs } = await withTimeout(
+        supabase
+          .from('activity_logs')
+          .select('*')
+          .eq('user_id', userId)
+          .order('timestamp', { ascending: false })
+          .limit(50),
+        10000,
+        'getActivityLogs direct query'
+      );
 
       if (dbLogs && dbLogs.length > 0) {
         const formatted: ActivityLogItem[] = dbLogs.map((l: any) => ({
@@ -60,7 +86,7 @@ export const getActivityLogs = async (
       }
     }
 
-    // 2. Try fetching from local cache
+    // 3. Try fetching from local cache
     const raw = await AsyncStorage.getItem(key);
     if (raw) {
       const parsed: ActivityLogItem[] = JSON.parse(raw);
@@ -106,16 +132,27 @@ export const logActivity = async (
 
     // Save to Supabase activity_logs table
     if (userId) {
-      await supabase.from('activity_logs').insert({
-        id: newItem.id,
-        user_id: userId,
-        email_snapshot: email,
-        title,
-        message,
-        category,
-        mode,
-        timestamp: newItem.timestamp,
-      });
+      await withTimeout(
+        supabase.from('activity_logs').insert({
+          id: newItem.id,
+          user_id: userId,
+          email_snapshot: email,
+          title,
+          message,
+          category,
+          mode,
+          timestamp: newItem.timestamp,
+        }),
+        10000,
+        'logActivity insert'
+      ).catch(() => {});
+      // Invalidate the Redis cache so the next read is fresh
+      await withTimeout(
+        supabase.functions
+          .invoke('activity-log-cache-invalidate', { body: {} }),
+        10000,
+        'logActivity cache-invalidate'
+      ).catch(() => {});
     }
   } catch {
     // ignore
@@ -134,6 +171,9 @@ export const clearActivityLogs = async (userId?: string, email?: string): Promis
     await AsyncStorage.setItem(key, JSON.stringify([]));
     if (userId) {
       await supabase.from('activity_logs').delete().eq('user_id', userId);
+      await supabase.functions
+        .invoke('activity-log-cache-invalidate', { body: {} })
+        .catch(() => {});
     }
   } catch {
     // ignore

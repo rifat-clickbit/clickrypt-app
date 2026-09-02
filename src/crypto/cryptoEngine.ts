@@ -1,8 +1,106 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import './cryptoPolyfill';
-import * as openpgp from 'openpgp';
+
+export class VaultLockedError extends Error {
+  constructor(message = 'Vault is locked. Unlock with your master password to reveal this secret.') {
+    super(message);
+    this.name = 'VaultLockedError';
+  }
+}
+
+export class DecryptionFailedError extends Error {
+  constructor(message = 'Unable to decrypt this item.') {
+    super(message);
+    this.name = 'DecryptionFailedError';
+  }
+}
+
+export function isDecryptionKeyAvailable(
+  unlockedKey: string | null | undefined,
+  masterPass: string | null | undefined,
+  encryptedPrivateKey?: string
+): boolean {
+  if (unlockedKey && unlockedKey.includes('-----BEGIN PGP PRIVATE KEY')) return true;
+  if (masterPass && encryptedPrivateKey) return true;
+  return false;
+}
 
 const B64_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
+
+// Lazy-load the large openpgp library so the app can render before the 1.2 MB
+// module is parsed/evaluated. First call is cached for the rest of the session.
+let openpgpModule: any = null;
+let openpgpLoadPromise: Promise<any> | null = null;
+
+async function getOpenpgp(): Promise<any> {
+  if (openpgpModule) return openpgpModule;
+  if (!openpgpLoadPromise) {
+    openpgpLoadPromise = import('openpgp');
+  }
+  openpgpModule = await openpgpLoadPromise;
+  return openpgpModule;
+}
+
+// PGP private key parsing + unlocking is the most expensive step (S2K KDF).
+// Cache the parsed/decrypted PrivateKey object by the armored input so vault
+// decryption does not re-run the KDF for every single item.
+interface CachedPrivateKey {
+  rawArmored: string;
+  key: any;
+  isDecrypted: boolean;
+}
+let cachedPrivateKey: CachedPrivateKey | null = null;
+
+export function clearPrivateKeyCache(): void {
+  cachedPrivateKey = null;
+}
+
+export async function getUnlockedPrivateKey(
+  privateKeyArmored: string,
+  passphrase?: string
+): Promise<any> {
+  const openpgp = await getOpenpgp();
+
+  if (cachedPrivateKey?.rawArmored === privateKeyArmored) {
+    if (cachedPrivateKey.isDecrypted) {
+      return cachedPrivateKey.key;
+    }
+    if (passphrase) {
+      try {
+        const decrypted = await openpgp.decryptKey({
+          privateKey: cachedPrivateKey.key,
+          passphrase,
+        });
+        cachedPrivateKey = { rawArmored: privateKeyArmored, key: decrypted, isDecrypted: true };
+        return decrypted;
+      } catch {
+        // passphrase variant failed; return the cached protected key and let the
+        // caller decide to try the next variant
+        return cachedPrivateKey.key;
+      }
+    }
+    return cachedPrivateKey.key;
+  }
+
+  let privateKey = await openpgp.readPrivateKey({
+    armoredKey: privateKeyArmored.trim(),
+  });
+
+  if (!privateKey.isDecrypted() && passphrase) {
+    try {
+      privateKey = await openpgp.decryptKey({ privateKey, passphrase });
+    } catch {
+      // keep protected key; caller will retry or throw
+    }
+  }
+
+  cachedPrivateKey = {
+    rawArmored: privateKeyArmored,
+    key: privateKey,
+    isDecrypted: privateKey.isDecrypted(),
+  };
+  return privateKey;
+}
 
 export interface KeyPairResult {
   publicKey: string;
@@ -170,19 +268,54 @@ export function generateSymmetricKey(): string {
 }
 
 export async function generateKeyPair(email: string, passphrase: string): Promise<KeyPairResult> {
-  const salt = Math.random().toString(36).substring(2, 10);
-  const mockPriv = `[ENCRYPTED-PRIV-KEY::${safeBase64Encode(passphrase + '::' + salt)}]`;
-  const mockPub = `[PUBLIC-KEY::${safeBase64Encode(email + '::' + salt)}]`;
-  return { privateKey: mockPriv, publicKey: mockPub };
+  if (!email || !passphrase) {
+    throw new Error('Email and passphrase are required to generate a key pair');
+  }
+  try {
+    const openpgp = await getOpenpgp();
+    const { privateKey, publicKey } = await openpgp.generateKey({
+      type: 'ecc',
+      curve: 'curve25519',
+      userIDs: [{ name: email, email }],
+      passphrase,
+      format: 'armored',
+    });
+    return { privateKey, publicKey };
+  } catch (err) {
+    console.warn('[Crypto] generateKeyPair failed:', err);
+    throw err;
+  }
 }
 
 export async function encryptWithPublicKey(data: string, publicKeyArmored?: string): Promise<string> {
   if (!data) return '';
+  if (!publicKeyArmored) return data;
+
+  // Backward-compatible: legacy mock public keys (e.g. [PUBLIC-KEY::...])
+  if (publicKeyArmored.startsWith('[PUBLIC-KEY::')) {
+    try {
+      return `[RSA-ENCRYPTED-KEY::${safeBase64Encode(data)}]`;
+    } catch {
+      return data;
+    }
+  }
+
   try {
-    const encoded = safeBase64Encode(data);
-    return `[RSA-ENCRYPTED-KEY::${encoded}]`;
-  } catch {
-    return data;
+    const openpgp = await getOpenpgp();
+    const publicKey = await openpgp.readKey({ armoredKey: publicKeyArmored.trim() });
+    const message = await openpgp.createMessage({ text: data });
+    // openpgp v6 returns the armored string directly (not { data }) when
+    // format: 'armored' is used. Guard both shapes for safety.
+    const encrypted: any = await openpgp.encrypt({
+      message,
+      encryptionKeys: publicKey,
+      format: 'armored',
+    });
+    return typeof encrypted === 'string' ? encrypted : String(encrypted?.data ?? '');
+  } catch (err) {
+    console.warn('[Crypto] encryptWithPublicKey failed:', err);
+    // If real encryption fails, do not silently store plaintext
+    throw err;
   }
 }
 
@@ -192,28 +325,96 @@ export async function decryptWithPrivateKey(
   passphrase?: string
 ): Promise<string> {
   if (!encryptedData) return '';
+  const trimmed = encryptedData.trim();
+
+  // Backward-compatible: legacy mock keys stored as our own markers
+  if (trimmed.startsWith('[RSA-ENCRYPTED-KEY::')) {
+    const clean = trimmed.slice('[RSA-ENCRYPTED-KEY::'.length, -1);
+    return safeBase64Decode(clean);
+  }
+  if (trimmed.startsWith('[PGP-ENCRYPTED-BLOB::')) {
+    const clean = trimmed.slice('[PGP-ENCRYPTED-BLOB::'.length, -1);
+    return safeBase64Decode(clean);
+  }
+
+  // Plaintext / non-encrypted data is returned as-is
+  if (!trimmed.includes('-----BEGIN PGP MESSAGE-----')) {
+    return encryptedData;
+  }
+
+  if (!privateKeyArmored) return encryptedData;
+
   try {
-    const trimmed = encryptedData.trim();
-    if (trimmed.startsWith('[RSA-ENCRYPTED-KEY::')) {
-      const clean = trimmed.slice('[RSA-ENCRYPTED-KEY::'.length, -1);
-      return safeBase64Decode(clean);
+    const openpgp = await getOpenpgp();
+    const privateKey = await getUnlockedPrivateKey(privateKeyArmored, passphrase);
+    const message = await openpgp.readMessage({ armoredMessage: trimmed });
+    const { data: decrypted } = await openpgp.decrypt({
+      message,
+      decryptionKeys: privateKey,
+      format: 'utf8',
+    });
+    return String(decrypted);
+  } catch (err: any) {
+    const msg = err?.message || String(err);
+    if (msg.toLowerCase().includes('no decryption key packets found') || msg.toLowerCase().includes('not encrypted for your private key')) {
+      console.warn('[Crypto] decryptWithPrivateKey: ciphertext is not encrypted for this private key (wrong key or shared item).');
+    } else if (msg.toLowerCase().includes('incorrect key') || msg.toLowerCase().includes('passphrase')) {
+      console.warn('[Crypto] decryptWithPrivateKey: private key passphrase incorrect or missing.');
+    } else {
+      console.warn('[Crypto] decryptWithPrivateKey failed:', msg);
     }
-    if (trimmed.startsWith('[PGP-ENCRYPTED-BLOB::')) {
-      return safeBase64Decode(trimmed);
-    }
-    return encryptedData;
-  } catch {
-    return encryptedData;
+    // Returning the original armored string is dangerous if the caller then
+    // uses it as a symmetric key, so propagate the failure.
+    throw err;
   }
 }
 
 export async function encryptSecret(secret: string, publicKeyArmored?: string): Promise<string> {
   if (!secret) return '';
+  if (!publicKeyArmored) {
+    // No key provided: keep the old mock marker as a last resort
+    try {
+      return `[PGP-ENCRYPTED-BLOB::${safeBase64Encode(secret)}]`;
+    } catch {
+      return secret;
+    }
+  }
+
+  // Backward-compatible: legacy mock public keys
+  if (publicKeyArmored.startsWith('[PUBLIC-KEY::')) {
+    try {
+      return `[PGP-ENCRYPTED-BLOB::${safeBase64Encode(secret)}]`;
+    } catch {
+      return secret;
+    }
+  }
+
   try {
-    const encoded = safeBase64Encode(secret);
-    return `[PGP-ENCRYPTED-BLOB::${encoded}]`;
-  } catch {
-    return secret;
+    const openpgp = await getOpenpgp();
+    const message = await openpgp.createMessage({ text: secret });
+
+    if (publicKeyArmored.includes('-----BEGIN PGP PUBLIC KEY-----')) {
+      const publicKey = await openpgp.readKey({ armoredKey: publicKeyArmored.trim() });
+      // openpgp v6 returns the armored string directly (not { data }) when
+      // format: 'armored' is used. Guard both shapes for safety.
+      const encrypted: any = await openpgp.encrypt({
+        message,
+        encryptionKeys: publicKey,
+        format: 'armored',
+      });
+      return typeof encrypted === 'string' ? encrypted : String(encrypted?.data ?? '');
+    }
+
+    // The second argument is a symmetric key/passphrase
+    const encryptedSym: any = await openpgp.encrypt({
+      message,
+      passwords: [publicKeyArmored],
+      format: 'armored',
+    });
+    return typeof encryptedSym === 'string' ? encryptedSym : String(encryptedSym?.data ?? '');
+  } catch (err) {
+    console.warn('[Crypto] encryptSecret failed:', err);
+    throw err;
   }
 }
 
@@ -224,9 +425,9 @@ export async function unprotectPrivateKey(
   if (!privateKeyArmored || typeof privateKeyArmored !== 'string') {
     throw new Error('No private key provided');
   }
-  const rawKey = await openpgp.readPrivateKey({ armoredKey: privateKeyArmored.trim() });
-  if (rawKey.isDecrypted()) {
-    return rawKey.armor();
+  const privateKey = await getUnlockedPrivateKey(privateKeyArmored, passphrase);
+  if (privateKey.isDecrypted()) {
+    return privateKey.armor();
   }
 
   const cleanPass = passphrase ? passphrase.trim() : '';
@@ -242,12 +443,9 @@ export async function unprotectPrivateKey(
 
   for (const pass of passphrases) {
     try {
-      const privateKey = await openpgp.decryptKey({
-        privateKey: rawKey,
-        passphrase: pass,
-      });
-      if (privateKey.isDecrypted()) {
-        return privateKey.armor();
+      const unlocked = await getUnlockedPrivateKey(privateKeyArmored, pass);
+      if (unlocked.isDecrypted()) {
+        return unlocked.armor();
       }
     } catch {
       // continue
@@ -349,26 +547,29 @@ export async function decryptSecret(
   }
 
   if (trimmed.includes('-----BEGIN PGP MESSAGE-----')) {
+    const openpgp = await getOpenpgp();
     const message = await openpgp.readMessage({ armoredMessage: trimmed });
 
     // 1. If privateKeyArmored is provided (either already unlocked or protected)
     if (privateKeyArmored && privateKeyArmored.includes('-----BEGIN PGP PRIVATE KEY')) {
       try {
-        let privateKey = await openpgp.readPrivateKey({ armoredKey: privateKeyArmored });
-        if (!privateKey.isDecrypted() && passphrase) {
-          try {
-            privateKey = await openpgp.decryptKey({ privateKey, passphrase });
-          } catch {}
-        }
+        const privateKey = await getUnlockedPrivateKey(privateKeyArmored, passphrase);
         if (privateKey.isDecrypted()) {
           const { data: decrypted } = await openpgp.decrypt({
             message,
             decryptionKeys: privateKey,
           });
           if (decrypted) return String(decrypted);
+        } else {
+          console.warn('[Crypto] decryptSecret: private key is still locked after getUnlockedPrivateKey (passphrase may be missing or wrong).');
         }
       } catch (err: any) {
-        console.warn('OpenPGP private key decryption attempt failed:', err?.message);
+        const msg = err?.message || String(err);
+        if (msg.toLowerCase().includes('no decryption key packets found') || msg.toLowerCase().includes('not encrypted for your private key')) {
+          console.warn('[Crypto] decryptSecret: this PGP message is encrypted for a different private key.');
+        } else {
+          console.warn('[Crypto] decryptSecret: private-key decrypt failed:', msg);
+        }
       }
     }
 
@@ -380,7 +581,14 @@ export async function decryptSecret(
           passwords: [passphrase],
         });
         if (decrypted) return String(decrypted);
-      } catch {}
+      } catch (err: any) {
+        const msg = err?.message || String(err);
+        if (!msg.toLowerCase().includes('error')) {
+          // expected for wrong password; no need to warn
+        } else {
+          console.warn('[Crypto] decryptSecret: symmetric decrypt failed:', msg);
+        }
+      }
     }
 
     return '';

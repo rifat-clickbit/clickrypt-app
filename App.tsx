@@ -8,13 +8,16 @@ import {
   AppState,
   AppStateStatus,
   Text,
+  TextInput,
   TouchableOpacity,
+  ActivityIndicator,
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar as ExpoStatusBar } from 'expo-status-bar';
 import { colors } from './src/theme/colors';
 import { AuthProvider, useAuth } from './src/context/AuthContext';
-import { VaultProvider, useVault } from './src/context/VaultContext';
+import { useVault } from './src/context/VaultContext';
+import { VaultProvider } from './src/context/VaultContext';
 import { ThemeProvider, useTheme } from './src/theme/ThemeContext';
 import { BottomNav, TabType } from './src/components/BottomNav';
 import { PasswordsScreen } from './src/screens/PasswordsScreen';
@@ -24,14 +27,18 @@ import { TeamScreen } from './src/screens/TeamScreen';
 import { SettingsScreen } from './src/screens/SettingsScreen';
 import { AuthScreen } from './src/screens/AuthScreen';
 import { NavPasswordsIcon } from './src/components/Icons';
+import { ErrorBoundary } from './src/components/ErrorBoundary';
 import { initScreenProtection } from './src/services/screenProtection';
 import { requestNotificationPermissions } from './src/services/notificationService';
 
 const MainNavigator = () => {
-  const { isAuthenticated, unlockWithBiometrics, appMode } = useAuth();
+  const { isAuthenticated, isLoading, unlockWithBiometrics, unlockVault, appMode } = useAuth();
   const { activeTab, setActiveTab } = useVault();
   const { colors } = useTheme();
   const [isVaultLocked, setIsVaultLocked] = useState(false);
+  const [passwordInput, setPasswordInput] = useState('');
+  const [unlockError, setUnlockError] = useState<string | null>(null);
+  const [isUnlocking, setIsUnlocking] = useState(false);
   const backgroundTimeRef = useRef<number | null>(null);
 
   // If switched to personal mode while on team tab, switch to passwords
@@ -71,8 +78,38 @@ const MainNavigator = () => {
     const success = await unlockWithBiometrics();
     if (success) {
       setIsVaultLocked(false);
+      setUnlockError(null);
+      setPasswordInput('');
     }
   };
+
+  const handlePasswordUnlock = async () => {
+    if (!passwordInput.trim()) return;
+    setIsUnlocking(true);
+    setUnlockError(null);
+    try {
+      const ok = await unlockVault(passwordInput);
+      if (ok) {
+        setIsVaultLocked(false);
+        setPasswordInput('');
+        setUnlockError(null);
+      } else {
+        setUnlockError('Incorrect master password.');
+      }
+    } catch {
+      setUnlockError('Unlock failed. Please try again.');
+    } finally {
+      setIsUnlocking(false);
+    }
+  };
+
+  if (isLoading) {
+    return (
+      <View style={[styles.screenWrapper, { backgroundColor: colors.bg, alignItems: 'center', justifyContent: 'center' }]}>
+        <ActivityIndicator size="large" color={colors.cyan} />
+      </View>
+    );
+  }
 
   if (!isAuthenticated) {
     return <AuthScreen />;
@@ -91,6 +128,56 @@ const MainNavigator = () => {
           </Text>
           <TouchableOpacity style={[styles.unlockBtn, { backgroundColor: colors.cyan }]} activeOpacity={0.8} onPress={handleUnlock}>
             <Text style={styles.unlockBtnText}>Unlock with Biometrics</Text>
+          </TouchableOpacity>
+
+          {/* Master-password fallback so the app is never permanently trapped
+              when biometrics fail or are unavailable. */}
+          <View style={styles.lockDivider}>
+            <View style={[styles.lockDividerLine, { backgroundColor: colors.borderStrong }]} />
+            <Text style={[styles.lockDividerText, { color: colors.textMuted }]}>or</Text>
+            <View style={[styles.lockDividerLine, { backgroundColor: colors.borderStrong }]} />
+          </View>
+
+          <TextInput
+            style={[
+              styles.lockInput,
+              {
+                backgroundColor: colors.bg,
+                borderColor: unlockError ? colors.danger : colors.borderStrong,
+                color: colors.text,
+              },
+            ]}
+            placeholder="Master password"
+            placeholderTextColor={colors.textMuted}
+            secureTextEntry
+            value={passwordInput}
+            onChangeText={(text) => {
+              setPasswordInput(text);
+              if (unlockError) setUnlockError(null);
+            }}
+            onSubmitEditing={handlePasswordUnlock}
+            autoCapitalize="none"
+            autoCorrect={false}
+          />
+
+          {!!unlockError && (
+            <Text style={[styles.lockErrorText, { color: colors.danger }]}>{unlockError}</Text>
+          )}
+
+          <TouchableOpacity
+            style={[
+              styles.unlockBtn,
+              { backgroundColor: colors.cyan, opacity: isUnlocking || !passwordInput.trim() ? 0.5 : 1 },
+            ]}
+            activeOpacity={0.8}
+            onPress={handlePasswordUnlock}
+            disabled={isUnlocking || !passwordInput.trim()}
+          >
+            {isUnlocking ? (
+              <ActivityIndicator size="small" color="#062229" />
+            ) : (
+              <Text style={styles.unlockBtnText}>Unlock with Password</Text>
+            )}
           </TouchableOpacity>
         </View>
       </View>
@@ -113,26 +200,24 @@ const MainNavigator = () => {
 
 const AppRoot = () => {
   const { colors, isDark } = useTheme();
-  const isWeb = Platform.OS === 'web';
 
   return (
-    <View style={[styles.outerWebWrapper, { backgroundColor: isDark ? '#02090c' : '#f1f5f9' }]}>
-      <SafeAreaView
-        style={[
-          styles.container,
-          { backgroundColor: colors.bg },
-          isWeb && styles.webContainer,
-        ]}
-        edges={['top', 'left', 'right']}
-      >
-        <ExpoStatusBar style={isDark ? 'light' : 'dark'} backgroundColor={colors.bg} />
+    <SafeAreaView
+      style={[
+        styles.container,
+        { backgroundColor: colors.bg },
+      ]}
+      edges={['top', 'left', 'right']}
+    >
+      <ExpoStatusBar style={isDark ? 'light' : 'dark'} backgroundColor={colors.bg} />
         <AuthProvider>
           <VaultProvider>
-            <MainNavigator />
+            <ErrorBoundary>
+              <MainNavigator />
+            </ErrorBoundary>
           </VaultProvider>
         </AuthProvider>
       </SafeAreaView>
-    </View>
   );
 };
 
@@ -147,27 +232,6 @@ export default function App() {
 }
 
 const styles = StyleSheet.create({
-  outerWebWrapper: {
-    flex: 1,
-    width: '100%',
-    height: '100%',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  webContainer: {
-    width: '100%',
-    maxWidth: 480,
-    height: '100%',
-    maxHeight: '100%',
-    borderLeftWidth: 1,
-    borderRightWidth: 1,
-    borderLeftColor: 'rgba(34, 211, 238, 0.15)',
-    borderRightColor: 'rgba(34, 211, 238, 0.15)',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 10 },
-    shadowOpacity: 0.35,
-    shadowRadius: 30,
-  },
   container: {
     flex: 1,
     width: '100%',
@@ -233,5 +297,33 @@ const styles = StyleSheet.create({
     color: '#062229',
     fontSize: 13.5,
     fontWeight: '700',
+  },
+  lockDivider: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    width: '100%',
+    marginVertical: 4,
+  },
+  lockDividerLine: {
+    flex: 1,
+    height: 1,
+  },
+  lockDividerText: {
+    fontSize: 11,
+    marginHorizontal: 8,
+  },
+  lockInput: {
+    width: '100%',
+    borderWidth: 1,
+    borderRadius: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    fontSize: 14,
+  },
+  lockErrorText: {
+    fontSize: 12,
+    fontWeight: '600',
+    width: '100%',
+    textAlign: 'center',
   },
 });

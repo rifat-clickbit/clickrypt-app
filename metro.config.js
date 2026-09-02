@@ -3,15 +3,17 @@ const path = require('path');
 
 const config = getDefaultConfig(__dirname);
 
-const openpgpLightweightPath = path.resolve(
+const openpgpSourcePath = path.resolve(
   __dirname,
-  'node_modules/openpgp/dist/openpgp.min.mjs'
+  'node_modules/openpgp/dist/openpgp.mjs'
 );
 
 config.resolver.resolveRequest = (context, moduleName, platform) => {
-  if (moduleName === 'openpgp' || moduleName.startsWith('openpgp/')) {
+  // Use the full, unminified ESM build. The minified build breaks at runtime
+  // under Hermes/Metro (PacketList methods like filterByTag become undefined).
+  if (moduleName === 'openpgp') {
     return {
-      filePath: openpgpLightweightPath,
+      filePath: openpgpSourcePath,
       type: 'sourceFile',
     };
   }

@@ -1,3 +1,22 @@
+export type AppStartupState =
+  | 'INITIALIZING'
+  | 'DATABASE_CONNECTING'
+  | 'DATABASE_READY'
+  | 'LOADING_CREDENTIALS'
+  | 'DECRYPTING_CREDENTIALS'
+  | 'READY'
+  | 'ERROR';
+
+export interface PasswordDiagnosticLog {
+  passwordRecordFound: boolean;
+  encryptedPasswordPresent: boolean;
+  decryptionStarted?: number;
+  decryptionCompleted?: number;
+  decryptionSuccess: boolean;
+  passwordStateInitialized: boolean;
+  error?: string;
+}
+
 export interface UserProfile {
   id: string;
   authId?: string;
@@ -60,6 +79,7 @@ export interface VaultItem {
   // Decrypted & encrypted values for local display
   encryptedPassword?: string;
   decryptedPassword?: string;
+  encryptedSymmetricKey?: string;
 }
 
 export interface FolderItem {
@@ -89,6 +109,7 @@ export interface GroupItem {
   folderIds?: string[];
   assignedFolderIds?: string[];
   assignedResourceIds?: string[];
+  createdBy?: string;
   createdAt?: string;
   lastActive: string;
   sortOrder?: number;

@@ -11,5 +11,17 @@ npm-debug.*
 web-build/
 .env.local
 .env.*.local
+supabase/.env
+supabase/.env.*
 .DS_Store
 *.log
+
+# Test scripts with embedded service-role keys
+test-reveal-edit.mjs
+diagnose-vault.mjs
+
+# IDE / tool artifacts
+.zcode/
+patches/
+qr.png
+tunnel-qr.png

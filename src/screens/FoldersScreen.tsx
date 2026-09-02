@@ -49,6 +49,7 @@ export const FoldersScreen = () => {
 
   const handleCreateFolder = async () => {
     if (!newFolderName.trim()) return;
+    if (!user) return;
     const newFolder: FolderItem = {
       id: `fld-${Date.now()}`,
       name: newFolderName.trim(),
@@ -66,6 +67,7 @@ export const FoldersScreen = () => {
       id: newFolder.id,
       name: newFolder.name,
       mode: appMode,
+      owner_id: user.id,
       data: newFolder,
     });
 

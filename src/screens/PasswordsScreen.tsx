@@ -207,6 +207,7 @@ export const PasswordsScreen = () => {
 
   const handleCreateAndMove = async () => {
     if (!newFolderName.trim()) return;
+    if (!user) return;
     try {
       const newFld = {
         id: `fld-${Date.now()}`,
@@ -220,6 +221,7 @@ export const PasswordsScreen = () => {
         id: newFld.id,
         name: newFld.name,
         mode: appMode,
+        owner_id: user.id,
         data: newFld,
       });
       await refreshVault();
