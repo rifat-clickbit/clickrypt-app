@@ -20,10 +20,12 @@ if (typeof globalThis !== 'undefined') {
 
   if (!g.crypto.subtle) {
     // Only provide digest, which has a real pure-JS implementation.
-    // The other SubtleCrypto methods previously returned fixed/zeroed buffers,
-    // which silently produced corrupt keys/ciphertext. Missing methods throw
-    // so openpgp falls back to its own pure-JS implementations instead of using
-    // garbage WebCrypto output.
+    // The other SubtleCrypto methods return rejected promises so that
+    // openpgp v5 falls back to its own pure-JS implementations.
+    // (v6 requires WebCrypto and does not work in React Native.)
+    const notAvailable = async () => {
+      throw new Error('crypto.subtle method not available in React Native');
+    };
     g.crypto.subtle = {
       digest: async (algo: any, data: ArrayBuffer | Uint8Array) => {
         const arr = data instanceof Uint8Array ? data : new Uint8Array(data);
@@ -37,39 +39,17 @@ if (typeof globalThis !== 'undefined') {
         if (name === 'MD5') return md5(arr).slice().buffer;
         return sha256(arr).slice().buffer;
       },
-      importKey: async () => {
-        throw new Error('crypto.subtle.importKey is not available in this environment');
-      },
-      exportKey: async () => {
-        throw new Error('crypto.subtle.exportKey is not available in this environment');
-      },
-      generateKey: async () => {
-        throw new Error('crypto.subtle.generateKey is not available in this environment');
-      },
-      encrypt: async () => {
-        throw new Error('crypto.subtle.encrypt is not available in this environment');
-      },
-      decrypt: async () => {
-        throw new Error('crypto.subtle.decrypt is not available in this environment');
-      },
-      sign: async () => {
-        throw new Error('crypto.subtle.sign is not available in this environment');
-      },
-      verify: async () => {
-        throw new Error('crypto.subtle.verify is not available in this environment');
-      },
-      deriveKey: async () => {
-        throw new Error('crypto.subtle.deriveKey is not available in this environment');
-      },
-      deriveBits: async () => {
-        throw new Error('crypto.subtle.deriveBits is not available in this environment');
-      },
-      wrapKey: async () => {
-        throw new Error('crypto.subtle.wrapKey is not available in this environment');
-      },
-      unwrapKey: async () => {
-        throw new Error('crypto.subtle.unwrapKey is not available in this environment');
-      },
+      importKey: notAvailable,
+      exportKey: notAvailable,
+      generateKey: notAvailable,
+      encrypt: notAvailable,
+      decrypt: notAvailable,
+      sign: notAvailable,
+      verify: notAvailable,
+      deriveKey: notAvailable,
+      deriveBits: notAvailable,
+      wrapKey: notAvailable,
+      unwrapKey: notAvailable,
     };
   }
 

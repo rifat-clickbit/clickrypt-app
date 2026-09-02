@@ -308,7 +308,7 @@ export async function encryptWithPublicKey(data: string, publicKeyArmored?: stri
     // format: 'armored' is used. Guard both shapes for safety.
     const encrypted: any = await openpgp.encrypt({
       message,
-      encryptionKeys: publicKey,
+      encryptionKeys: publicKey, publicKeys: publicKey,
       format: 'armored',
     });
     return typeof encrypted === 'string' ? encrypted : String(encrypted?.data ?? '');
@@ -350,7 +350,7 @@ export async function decryptWithPrivateKey(
     const message = await openpgp.readMessage({ armoredMessage: trimmed });
     const { data: decrypted } = await openpgp.decrypt({
       message,
-      decryptionKeys: privateKey,
+      decryptionKeys: privateKey, privateKeys: privateKey,
       format: 'utf8',
     });
     return String(decrypted);
@@ -399,7 +399,7 @@ export async function encryptSecret(secret: string, publicKeyArmored?: string): 
       // format: 'armored' is used. Guard both shapes for safety.
       const encrypted: any = await openpgp.encrypt({
         message,
-        encryptionKeys: publicKey,
+        encryptionKeys: publicKey, publicKeys: publicKey,
         format: 'armored',
       });
       return typeof encrypted === 'string' ? encrypted : String(encrypted?.data ?? '');
@@ -565,7 +565,7 @@ export async function decryptSecret(
         if (privateKey.isDecrypted()) {
           const { data: decrypted } = await openpgp.decrypt({
             message,
-            decryptionKeys: privateKey,
+            decryptionKeys: privateKey, privateKeys: privateKey,
           });
           if (decrypted) return String(decrypted);
         } else {
