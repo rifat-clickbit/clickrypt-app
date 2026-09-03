@@ -22,6 +22,7 @@ import {
   LucideFolder,
   LucideKeyRound,
   EyeIcon,
+  EyeOffIcon,
   CopyIcon,
   LucideBuilding,
   AlertWarningIcon,
@@ -453,10 +454,11 @@ export const AuthScreen = () => {
                     onPress={() => setShowPassword(!showPassword)}
                     activeOpacity={0.7}
                   >
-                    <EyeIcon
-                      size={16}
-                      color={showPassword ? colors.cyan : colors.textMuted}
-                    />
+                    {showPassword ? (
+                      <EyeOffIcon size={16} color={colors.cyan} />
+                    ) : (
+                      <EyeIcon size={16} color={colors.textMuted} />
+                    )}
                   </TouchableOpacity>
                 </View>
               </View>

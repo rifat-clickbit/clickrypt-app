@@ -26,7 +26,7 @@ import { FoldersScreen } from './src/screens/FoldersScreen';
 import { TeamScreen } from './src/screens/TeamScreen';
 import { SettingsScreen } from './src/screens/SettingsScreen';
 import { AuthScreen } from './src/screens/AuthScreen';
-import { NavPasswordsIcon, EyeIcon } from './src/components/Icons';
+import { NavPasswordsIcon, EyeIcon, EyeOffIcon } from './src/components/Icons';
 import { ErrorBoundary } from './src/components/ErrorBoundary';
 import { initScreenProtection } from './src/services/screenProtection';
 import { requestNotificationPermissions } from './src/services/notificationService';
@@ -192,10 +192,11 @@ const MainNavigator = () => {
               activeOpacity={0.7}
               hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
             >
-              <EyeIcon
-                size={16}
-                color={showUnlockPassword ? colors.cyan : colors.textMuted}
-              />
+              {showUnlockPassword ? (
+                <EyeOffIcon size={16} color={colors.cyan} />
+              ) : (
+                <EyeIcon size={16} color={colors.textMuted} />
+              )}
             </TouchableOpacity>
           </View>
           {!!unlockError && (

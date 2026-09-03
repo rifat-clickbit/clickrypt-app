@@ -7,6 +7,7 @@ import {
   ChevronDownIcon,
   ChevronRightIcon,
   EyeIcon,
+  EyeOffIcon,
   CopyIcon,
   ShareIcon,
   EditIcon,
@@ -299,6 +300,8 @@ export const PasswordCard: React.FC<PasswordCardProps> = ({
               >
                 {isRevealing ? (
                   <ActivityIndicator size="small" color={colors.cyan} style={{ marginRight: 4 }} />
+                ) : isRevealed ? (
+                  <EyeOffIcon size={13} color={colors.cyan} />
                 ) : (
                   <EyeIcon size={13} color={colors.cyan} />
                 )}
@@ -377,7 +380,11 @@ export const PasswordCard: React.FC<PasswordCardProps> = ({
                     hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
                     onPress={handleToggleReveal}
                   >
-                    <EyeIcon size={13} color={isRevealed ? colors.cyan : colors.textSecondary} />
+                    {isRevealed ? (
+                      <EyeOffIcon size={13} color={colors.cyan} />
+                    ) : (
+                      <EyeIcon size={13} color={colors.textSecondary} />
+                    )}
                   </TouchableOpacity>
 
                   <TouchableOpacity

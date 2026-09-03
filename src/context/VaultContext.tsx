@@ -446,6 +446,7 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
           score: isBreached ? 20 : 90,
           strength: isBreached ? 'Weak' : 'Strong',
           secrets: [{ userId: user.id, encryptedData: encryptedBlob }],
+          encryptedSymmetricKey: encryptedKeyForOwner,
           mode: appMode,
           decryptedPassword: secretToEncrypt,
         };
@@ -1060,39 +1061,42 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
         }
       }
 
-      try {
-        const { data: shareData } = await withTimeout(
-          supabase
-            .from('resource_shares')
-            .select('*')
-            .eq('resource_id', item.id)
-            .eq('recipient_id', user.id)
-            .maybeSingle(),
-          6000,
-          'revealPassword resource_shares lookup'
-        );
-
-        if (shareData?.encrypted_symmetric_key) {
-          const decryptedSymKey = await decryptWithPrivateKey(
-            shareData.encrypted_symmetric_key,
-            activeKey
+      // Check resource_shares if item is shared or symmetric unwrap wasn't in local item
+      if (item.ownerId !== user.id || !encSymKey) {
+        try {
+          const { data: shareData } = await withTimeout(
+            supabase
+              .from('resource_shares')
+              .select('*')
+              .eq('resource_id', item.id)
+              .eq('recipient_id', user.id)
+              .maybeSingle(),
+            2500,
+            'revealPassword resource_shares lookup'
           );
-          const decrypted = rawBlob
-            ? await decryptSecret(rawBlob, undefined, decryptedSymKey)
-            : decryptedSymKey;
 
-          if (
-            decrypted &&
-            decrypted.trim() &&
-            !isEncryptedCipher(decrypted) &&
-            decrypted !== '•••••••' &&
-            decrypted !== '••••••••'
-          ) {
-            return await commitDecrypted(decrypted);
+          if (shareData?.encrypted_symmetric_key) {
+            const decryptedSymKey = await decryptWithPrivateKey(
+              shareData.encrypted_symmetric_key,
+              activeKey
+            );
+            const decrypted = rawBlob
+              ? await decryptSecret(rawBlob, undefined, decryptedSymKey)
+              : decryptedSymKey;
+
+            if (
+              decrypted &&
+              decrypted.trim() &&
+              !isEncryptedCipher(decrypted) &&
+              decrypted !== '•••••••' &&
+              decrypted !== '••••••••'
+            ) {
+              return await commitDecrypted(decrypted);
+            }
           }
+        } catch (err: any) {
+          console.warn(`[Vault] revealPassword resource_share branch notice for item ${item.id}:`, err?.message || err);
         }
-      } catch (err: any) {
-        console.warn(`[Vault] revealPassword resource_share branch failed for item ${item.id}:`, err?.message || err);
       }
 
       if (rawBlob && typeof rawBlob === 'string') {

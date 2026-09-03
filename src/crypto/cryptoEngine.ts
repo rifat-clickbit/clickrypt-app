@@ -380,8 +380,10 @@ export async function encryptWithPublicKey(data: string, publicKeyArmored?: stri
   if (!data) return '';
   if (!publicKeyArmored) return data;
 
+  const normalizedPubKey = normalizeArmoredKey(publicKeyArmored);
+
   // Backward-compatible: legacy mock public keys (e.g. [PUBLIC-KEY::...])
-  if (publicKeyArmored.startsWith('[PUBLIC-KEY::')) {
+  if (publicKeyArmored.startsWith('[PUBLIC-KEY::') || normalizedPubKey.startsWith('[PUBLIC-KEY::')) {
     try {
       return `[RSA-ENCRYPTED-KEY::${safeBase64Encode(data)}]`;
     } catch {
@@ -391,7 +393,7 @@ export async function encryptWithPublicKey(data: string, publicKeyArmored?: stri
 
   try {
     const openpgp = await getOpenpgp();
-    const publicKey = await openpgp.readKey({ armoredKey: publicKeyArmored.trim() });
+    const publicKey = await openpgp.readKey({ armoredKey: normalizedPubKey });
     const message = await openpgp.createMessage({ text: data });
     const encrypted: any = await openpgp.encrypt({
       message,
@@ -423,8 +425,10 @@ export async function decryptWithPrivateKey(
     return safeBase64Decode(clean);
   }
 
+  const cleanCipher = normalizeArmoredKey(trimmed);
+
   // Plaintext / non-encrypted data is returned as-is
-  if (!trimmed.includes('-----BEGIN PGP MESSAGE-----')) {
+  if (!cleanCipher.includes('-----BEGIN PGP MESSAGE-----')) {
     return encryptedData;
   }
 
@@ -433,7 +437,6 @@ export async function decryptWithPrivateKey(
 
   try {
     const openpgp = await getOpenpgp();
-    const cleanCipher = normalizeArmoredKey(trimmed);
     const privateKey = await getUnlockedPrivateKey(effectiveKey, passphrase);
     const message = await openpgp.readMessage({ armoredMessage: cleanCipher });
     const { data: decrypted } = await openpgp.decrypt({
@@ -465,8 +468,10 @@ export async function encryptSecret(secret: string, publicKeyArmored?: string): 
     }
   }
 
+  const normalizedPubKey = normalizeArmoredKey(publicKeyArmored);
+
   // Backward-compatible: legacy mock public keys
-  if (publicKeyArmored.startsWith('[PUBLIC-KEY::')) {
+  if (publicKeyArmored.startsWith('[PUBLIC-KEY::') || normalizedPubKey.startsWith('[PUBLIC-KEY::')) {
     try {
       return `[PGP-ENCRYPTED-BLOB::${safeBase64Encode(secret)}]`;
     } catch {
@@ -478,8 +483,8 @@ export async function encryptSecret(secret: string, publicKeyArmored?: string): 
     const openpgp = await getOpenpgp();
     const message = await openpgp.createMessage({ text: secret });
 
-    if (publicKeyArmored.includes('-----BEGIN PGP PUBLIC KEY-----')) {
-      const publicKey = await openpgp.readKey({ armoredKey: publicKeyArmored.trim() });
+    if (normalizedPubKey.includes('-----BEGIN PGP PUBLIC KEY-----')) {
+      const publicKey = await openpgp.readKey({ armoredKey: normalizedPubKey });
       const encrypted: any = await openpgp.encrypt({
         message,
         encryptionKeys: publicKey,
@@ -637,19 +642,22 @@ export async function decryptSecret(
     return safeBase64Decode(trimmed);
   }
 
-  if (trimmed.includes('-----BEGIN PGP MESSAGE-----')) {
+  const cleanCipher = normalizeArmoredKey(trimmed);
+
+  if (cleanCipher.includes('-----BEGIN PGP MESSAGE-----')) {
     const openpgp = await getOpenpgp();
     let message: any;
     try {
-      message = await openpgp.readMessage({ armoredMessage: trimmed });
+      message = await openpgp.readMessage({ armoredMessage: cleanCipher });
     } catch {
       return '';
     }
 
     // 1. If privateKeyArmored is provided (either already unlocked or protected)
-    if (privateKeyArmored && privateKeyArmored.includes('-----BEGIN PGP PRIVATE KEY')) {
+    const effectivePrivKey = privateKeyArmored ? normalizeArmoredKey(privateKeyArmored) : '';
+    if (effectivePrivKey && effectivePrivKey.includes('-----BEGIN PGP PRIVATE KEY')) {
       try {
-        const privateKey = await getUnlockedPrivateKey(privateKeyArmored, passphrase);
+        const privateKey = await getUnlockedPrivateKey(effectivePrivKey, passphrase);
         if (typeof privateKey.isDecrypted === 'function' && privateKey.isDecrypted()) {
           const { data: decrypted } = await openpgp.decrypt({
             message,
