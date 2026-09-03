@@ -109,7 +109,10 @@ export const ShareModal: React.FC<ShareModalProps> = ({ visible, onClose, item }
       );
       onClose();
     } else {
-      Alert.alert('Error', 'Failed to share item.');
+      Alert.alert(
+        'Unable to Share',
+        'This colleague has not yet activated their vault encryption keys. Once they create their account, you will be able to share credentials with them.'
+      );
     }
   };
 

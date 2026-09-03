@@ -146,6 +146,10 @@ export const AuthScreen = () => {
         setErrorMsg('Please enter your full name.');
         return;
       }
+      if (password.trim().length < 8) {
+        setErrorMsg('Master Password must be at least 8 characters long.');
+        return;
+      }
       const res = await register(name, cleanEmail, password);
       if (!res.success) setErrorMsg(res.error || 'Registration failed');
     } else {
