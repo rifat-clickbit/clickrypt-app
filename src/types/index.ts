@@ -49,7 +49,7 @@ export interface UserProfile {
   authId?: string;
   email: string;
   name: string;
-  role: 'Owner' | 'Admin' | 'User' | 'External';
+  role: 'Owner' | 'Admin' | 'User' | 'External' | 'Member' | 'Viewer';
   accountMode: 'personal' | 'organization';
   status?: 'Active' | 'Suspended' | 'Invited';
   publicKey?: string;
@@ -57,9 +57,12 @@ export interface UserProfile {
   avatarUrl?: string;
   twoFactorEnabled?: boolean;
   twoFactorSecret?: string;
+  organizationId?: string;
+  managedByOrganizationId?: string;
   organization?: {
     id: string;
     domain: string;
+    name?: string;
     verificationStatus: 'pending' | 'verified';
     openEnrollment: boolean;
   } | null;
@@ -151,4 +154,36 @@ export interface AuditLogItem {
   groupId?: string;
   details?: string;
   mode?: 'personal' | 'organization';
+}
+
+export interface Organization {
+  id: string;
+  name: string;
+  domain: string;
+  ownerId: string;
+  createdAt?: string;
+}
+
+export interface OrganizationMember {
+  id: string;
+  organizationId: string;
+  userId: string;
+  role: 'Owner' | 'Admin' | 'Member' | 'Viewer';
+  isManagedAccount: boolean;
+  status: 'active' | 'invited' | 'suspended';
+  invitedBy?: string;
+  createdAt?: string;
+}
+
+export interface DeleteAccountResult {
+  success: boolean;
+  deletionType?: 'PERSONAL_ACCOUNT' | 'ORGANIZATION_OWNER';
+  failedStep?: string;
+  failedTable?: string;
+  error?: string;
+  deletedUserIds?: string[];
+  deletedOrganizationIds?: string[];
+  completedSteps?: string[];
+  warnings?: string[];
+  legacyGroupsSkipped?: boolean;
 }

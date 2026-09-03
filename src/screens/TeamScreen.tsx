@@ -208,6 +208,8 @@ export const TeamScreen = () => {
       inviteEmail.trim()
     )}&role=${inviteRole}`;
 
+    const orgId = user?.organizationId || (user?.email ? `org-${user.email.split('@')[1].replace(/[^a-z0-9]/g, '')}` : `org-${user?.id}`);
+
     const newMember: MemberItem = {
       id: `usr-inv-${Date.now()}`,
       name: inviteName.trim() || inviteEmail.split('@')[0],
@@ -221,17 +223,33 @@ export const TeamScreen = () => {
     setGeneratedInviteLink(link);
 
     try {
+      // 1. Explicitly register member under managed organization
       await supabase.from('users').upsert({
         id: newMember.id,
         email: newMember.email,
         name: newMember.name,
         account_mode: 'organization',
+        organization_id: orgId,
+        managed_by_organization_id: orgId,
         data: {
           ...newMember,
+          organizationId: orgId,
+          managedByOrganizationId: orgId,
           status: 'Invited',
           invitedAt: new Date().toISOString(),
           inviteLink: link,
         },
+      });
+
+      // 2. Explicitly create membership relation row
+      await supabase.from('organization_members').upsert({
+        id: `om-${Date.now()}`,
+        organization_id: orgId,
+        user_id: newMember.id,
+        role: inviteRole,
+        is_managed_account: true,
+        status: 'invited',
+        invited_by: user?.id,
       });
     } catch {
       // ignore

@@ -304,7 +304,10 @@ export const SettingsScreen = () => {
       setIsDeleteModalOpen(false);
       setDeleteConfirmText('');
 
-      let successMsg = 'Your account and all vault data have been permanently removed.';
+      let successMsg =
+        res.deletionType === 'ORGANIZATION_OWNER'
+          ? 'Your organization, all managed team member accounts, and all vault data have been permanently deleted.'
+          : 'Your account and all vault data have been permanently removed.';
       if (res.legacyGroupsSkipped) {
         successMsg += '\n\nNote: one or more organization groups could not be deleted because their creator is not recorded in the database.';
       }

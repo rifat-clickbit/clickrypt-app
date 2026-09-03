@@ -16,7 +16,7 @@ import {
   isVaultSessionUnlocked,
 } from '../crypto/cryptoEngine';
 import { withTimeout } from '../utils/withTimeout';
-import { UserProfile, AppStartupState, AuthResult } from '../types';
+import { UserProfile, AppStartupState, AuthResult, DeleteAccountResult } from '../types';
 
 interface AuthContextType {
   user: UserProfile | null;
@@ -39,14 +39,7 @@ interface AuthContextType {
   ) => Promise<{ success: boolean; error?: string }>;
   switchModeAndLogout: (targetMode: 'personal' | 'organization') => Promise<void>;
   logout: () => Promise<void>;
-  deleteAccount: () => Promise<{
-    success: boolean;
-    error?: string;
-    failedStep?: string;
-    failedTable?: string;
-    warnings?: string[];
-    legacyGroupsSkipped?: boolean;
-  }>;
+  deleteAccount: () => Promise<DeleteAccountResult>;
   refreshUserProfile: () => Promise<void>;
   isLoading: boolean;
   startupState: AppStartupState;
@@ -838,6 +831,9 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         // Fall back to direct profile creation in public.users
       }
 
+      const domain = cleanEmail.includes('@') ? cleanEmail.split('@')[1] : '';
+      const orgId = appMode === 'organization' ? `org-${Date.now()}` : undefined;
+
       const newUser: UserProfile = {
         id: `usr-${Date.now()}`,
         authId: authId || `auth-${Date.now()}`,
@@ -845,6 +841,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         name: name.trim(),
         role: 'Owner',
         accountMode: appMode,
+        organizationId: orgId,
         publicKey,
         encryptedPrivateKey: privateKey,
         twoFactorEnabled: false,
@@ -872,6 +869,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         email: cleanEmail,
         name: newUser.name,
         account_mode: appMode,
+        organization_id: orgId,
         data: {
           ...newUser,
           publicKey,
@@ -884,6 +882,31 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         20000,
         'register users upsert'
       );
+
+      // If registering in organization mode, register explicit organization & owner membership
+      if (appMode === 'organization' && orgId) {
+        try {
+          const orgName = domain ? `${domain.split('.')[0].toUpperCase()} Organization` : `${name.trim()}'s Org`;
+          await supabase.from('organizations').upsert({
+            id: orgId,
+            name: orgName,
+            domain: domain || 'company.com',
+            owner_id: newUser.id,
+            data: { name: orgName, domain, ownerId: newUser.id },
+          });
+
+          await supabase.from('organization_members').upsert({
+            id: `om-${Date.now()}`,
+            organization_id: orgId,
+            user_id: newUser.id,
+            role: 'Owner',
+            is_managed_account: false,
+            status: 'active',
+          });
+        } catch (orgErr) {
+          console.warn('[Auth] organization registration notice:', orgErr);
+        }
+      }
 
       await withTimeout(
         supabase.functions.invoke('user-profile-cache-invalidate', { body: {} }),
@@ -1043,14 +1066,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     ]);
   };
 
-  const deleteAccount = async (): Promise<{
-    success: boolean;
-    error?: string;
-    failedStep?: string;
-    failedTable?: string;
-    warnings?: string[];
-    legacyGroupsSkipped?: boolean;
-  }> => {
+  const deleteAccount = async (): Promise<DeleteAccountResult> => {
     try {
       if (!user) return { success: false, error: 'No active session found.' };
 
@@ -1079,6 +1095,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         return {
           success: false,
           error: message,
+          deletionType: data?.deletionType,
           failedStep: data?.failedStep,
           failedTable: data?.failedTable,
           warnings: data?.warnings,
@@ -1116,6 +1133,10 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
       return {
         success: true,
+        deletionType: data?.deletionType || (user.role === 'Owner' ? 'ORGANIZATION_OWNER' : 'PERSONAL_ACCOUNT'),
+        deletedOrganizationIds: data?.deletedOrganizationIds,
+        deletedUserIds: data?.deletedUserIds,
+        completedSteps: data?.completedSteps,
         warnings: data?.warnings,
         legacyGroupsSkipped: data?.legacyGroupsSkipped,
       };
