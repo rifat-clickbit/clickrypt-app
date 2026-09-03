@@ -26,17 +26,30 @@ import { FoldersScreen } from './src/screens/FoldersScreen';
 import { TeamScreen } from './src/screens/TeamScreen';
 import { SettingsScreen } from './src/screens/SettingsScreen';
 import { AuthScreen } from './src/screens/AuthScreen';
-import { NavPasswordsIcon } from './src/components/Icons';
+import { NavPasswordsIcon, EyeIcon } from './src/components/Icons';
 import { ErrorBoundary } from './src/components/ErrorBoundary';
 import { initScreenProtection } from './src/services/screenProtection';
 import { requestNotificationPermissions } from './src/services/notificationService';
 
 const MainNavigator = () => {
-  const { isAuthenticated, isLoading, unlockWithBiometrics, unlockVault, appMode, startupState, credentialsResolved } = useAuth();
+  const {
+    isAuthenticated,
+    isLoading,
+    unlockWithBiometrics,
+    unlockVault,
+    lockVault,
+    appMode,
+    startupState,
+    credentialsResolved,
+    isVaultUnlocked,
+    user,
+    logout,
+  } = useAuth();
   const { activeTab, setActiveTab, isSyncing, items } = useVault();
   const { colors } = useTheme();
   const [isVaultLocked, setIsVaultLocked] = useState(false);
   const [passwordInput, setPasswordInput] = useState('');
+  const [showUnlockPassword, setShowUnlockPassword] = useState(false);
   const [unlockError, setUnlockError] = useState<string | null>(null);
   const [isUnlocking, setIsUnlocking] = useState(false);
   const backgroundTimeRef = useRef<number | null>(null);
@@ -63,6 +76,7 @@ const MainNavigator = () => {
           // Auto-lock after 120 seconds in background
           if (elapsed > 120) {
             setIsVaultLocked(true);
+            lockVault();
           }
         }
         backgroundTimeRef.current = null;
@@ -72,14 +86,16 @@ const MainNavigator = () => {
     return () => {
       subscription.remove();
     };
-  }, []);
+  }, [lockVault]);
 
   const handleUnlock = async () => {
-    const success = await unlockWithBiometrics();
-    if (success) {
+    const res = await unlockWithBiometrics();
+    if (res.success) {
       setIsVaultLocked(false);
       setUnlockError(null);
       setPasswordInput('');
+    } else if (res.error) {
+      setUnlockError(res.error);
     }
   };
 
@@ -88,16 +104,16 @@ const MainNavigator = () => {
     setIsUnlocking(true);
     setUnlockError(null);
     try {
-      const ok = await unlockVault(passwordInput);
-      if (ok) {
+      const res = await unlockVault(passwordInput);
+      if (res.success) {
         setIsVaultLocked(false);
         setPasswordInput('');
         setUnlockError(null);
       } else {
-        setUnlockError('Incorrect master password.');
+        setUnlockError(res.error || 'Incorrect master password.');
       }
-    } catch {
-      setUnlockError('Unlock failed. Please try again.');
+    } catch (err: any) {
+      setUnlockError(err?.message || 'Unlock failed. Please try again.');
     } finally {
       setIsUnlocking(false);
     }
@@ -119,16 +135,20 @@ const MainNavigator = () => {
     );
   }
 
-  if (isVaultLocked) {
+  const isVaultEffectivelyLocked = isVaultLocked || !isVaultUnlocked;
+
+  if (isVaultEffectivelyLocked) {
     return (
       <View style={[styles.lockOverlay, { backgroundColor: colors.bg }]}>
         <View style={[styles.lockCard, { backgroundColor: colors.surface, borderColor: colors.borderStrong }]}>
           <View style={[styles.lockBadge, { backgroundColor: colors.cyanBg, borderColor: colors.cyanBorder }]}>
             <NavPasswordsIcon size={32} color={colors.cyan} />
           </View>
-          <Text style={[styles.lockTitle, { color: colors.text }]}>ClickRypt Locked</Text>
+          <Text style={[styles.lockTitle, { color: colors.text }]}>Unlock ClickRypt Vault</Text>
           <Text style={[styles.lockSubtitle, { color: colors.textMuted }]}>
-            Vault locked automatically due to inactivity.
+            {user?.email
+              ? `Welcome back, ${user.email}. Unlock your vault to access your credentials.`
+              : 'Enter your master password or use biometrics to unlock.'}
           </Text>
           <TouchableOpacity style={[styles.unlockBtn, { backgroundColor: colors.cyan }]} activeOpacity={0.8} onPress={handleUnlock}>
             <Text style={styles.unlockBtnText}>Unlock with Biometrics</Text>
@@ -142,28 +162,42 @@ const MainNavigator = () => {
             <View style={[styles.lockDividerLine, { backgroundColor: colors.borderStrong }]} />
           </View>
 
-          <TextInput
+          <View
             style={[
-              styles.lockInput,
+              styles.lockInputContainer,
               {
                 backgroundColor: colors.bg,
                 borderColor: unlockError ? colors.danger : colors.borderStrong,
-                color: colors.text,
               },
             ]}
-            placeholder="Master password"
-            placeholderTextColor={colors.textMuted}
-            secureTextEntry
-            value={passwordInput}
-            onChangeText={(text) => {
-              setPasswordInput(text);
-              if (unlockError) setUnlockError(null);
-            }}
-            onSubmitEditing={handlePasswordUnlock}
-            autoCapitalize="none"
-            autoCorrect={false}
-          />
-
+          >
+            <TextInput
+              style={[styles.lockInput, { color: colors.text }]}
+              placeholder="Master password"
+              placeholderTextColor={colors.textMuted}
+              secureTextEntry={!showUnlockPassword}
+              value={passwordInput}
+              onChangeText={(text) => {
+                setPasswordInput(text);
+                if (unlockError) setUnlockError(null);
+              }}
+              onSubmitEditing={handlePasswordUnlock}
+              autoCapitalize="none"
+              autoCorrect={false}
+              spellCheck={false}
+            />
+            <TouchableOpacity
+              style={styles.lockEyeBtn}
+              onPress={() => setShowUnlockPassword(!showUnlockPassword)}
+              activeOpacity={0.7}
+              hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+            >
+              <EyeIcon
+                size={16}
+                color={showUnlockPassword ? colors.cyan : colors.textMuted}
+              />
+            </TouchableOpacity>
+          </View>
           {!!unlockError && (
             <Text style={[styles.lockErrorText, { color: colors.danger }]}>{unlockError}</Text>
           )}
@@ -180,8 +214,21 @@ const MainNavigator = () => {
             {isUnlocking ? (
               <ActivityIndicator size="small" color="#062229" />
             ) : (
-              <Text style={styles.unlockBtnText}>Unlock with Password</Text>
+              <Text style={styles.unlockBtnText}>Unlock Vault</Text>
             )}
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            onPress={async () => {
+              await logout();
+              setPasswordInput('');
+              setUnlockError(null);
+            }}
+            style={{ marginTop: 16, alignItems: 'center' }}
+          >
+            <Text style={{ fontSize: 13, color: colors.cyan, fontWeight: '600' }}>
+              Sign in with another account →
+            </Text>
           </TouchableOpacity>
         </View>
       </View>
@@ -316,13 +363,23 @@ const styles = StyleSheet.create({
     fontSize: 11,
     marginHorizontal: 8,
   },
-  lockInput: {
+  lockInputContainer: {
     width: '100%',
+    flexDirection: 'row',
+    alignItems: 'center',
     borderWidth: 1,
     borderRadius: 10,
-    paddingHorizontal: 14,
+    paddingHorizontal: 12,
+  },
+  lockInput: {
+    flex: 1,
     paddingVertical: 12,
     fontSize: 14,
+  },
+  lockEyeBtn: {
+    padding: 6,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   lockErrorText: {
     fontSize: 12,

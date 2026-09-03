@@ -9,24 +9,29 @@ import {
   verifyTOTPCode,
   unprotectPrivateKey,
   canUnlockPrivateKey,
+  setSessionUnlockedKey,
+  getSessionUnlockedKey,
+  clearSessionKey,
+  clearPrivateKeyCache,
+  isVaultSessionUnlocked,
 } from '../crypto/cryptoEngine';
 import { withTimeout } from '../utils/withTimeout';
-import { UserProfile, AppStartupState } from '../types';
+import { UserProfile, AppStartupState, AuthResult } from '../types';
 
 interface AuthContextType {
   user: UserProfile | null;
   isAuthenticated: boolean;
-  masterPassword: string | null;
-  unlockedPgpKey: string | null;
+  isVaultUnlocked: boolean;
   appMode: 'personal' | 'organization';
   setAppMode: (mode: 'personal' | 'organization') => void;
   check2FAStatus: (email: string) => Promise<{ requires2FA: boolean; secret?: string }>;
   verify2FACode: (secret: string, code: string) => boolean;
-  toggleAccount2FA: (enable: boolean, secret?: string) => Promise<boolean>;
-  login: (email: string, masterPassword: string) => Promise<{ success: boolean; error?: string }>;
-  register: (name: string, email: string, masterPassword: string) => Promise<{ success: boolean; error?: string }>;
-  unlockVault: (password: string) => Promise<boolean>;
-  unlockWithBiometrics: () => Promise<boolean>;
+  toggleAccount2FA: (enable: boolean, secret?: string) => Promise<AuthResult>;
+  login: (email: string, masterPassword: string) => Promise<AuthResult>;
+  register: (name: string, email: string, masterPassword: string) => Promise<AuthResult>;
+  unlockVault: (password: string) => Promise<AuthResult>;
+  lockVault: () => void;
+  unlockWithBiometrics: () => Promise<AuthResult>;
   updateProfile: (
     name: string,
     email?: string,
@@ -52,8 +57,7 @@ const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export const AuthProvider = ({ children }: { children: ReactNode }) => {
   const [user, setUser] = useState<UserProfile | null>(null);
-  const [masterPassword, setMasterPassword] = useState<string | null>(null);
-  const [unlockedPgpKey, setUnlockedPgpKey] = useState<string | null>(null);
+  const [isVaultUnlocked, setIsVaultUnlocked] = useState<boolean>(isVaultSessionUnlocked());
   const [appMode, setAppModeState] = useState<'personal' | 'organization'>('personal');
   const [isLoading, setIsLoading] = useState(true);
   const [startupState, setStartupState] = useState<AppStartupState>('INITIALIZING');
@@ -108,33 +112,57 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         }
       }
 
+      let parsedData: any = {};
+      if (dbUser.data) {
+        if (typeof dbUser.data === 'string') {
+          try {
+            parsedData = JSON.parse(dbUser.data);
+          } catch {
+            parsedData = {};
+          }
+        } else if (typeof dbUser.data === 'object') {
+          parsedData = dbUser.data;
+        }
+      }
+
       const has2FA =
-        dbUser.data?.twoFactorEnabled !== undefined
+        parsedData.twoFactorEnabled !== undefined
+          ? !!parsedData.twoFactorEnabled
+          : dbUser.data?.twoFactorEnabled !== undefined
           ? !!dbUser.data?.twoFactorEnabled
           : dbUser.two_factor_enabled !== undefined
           ? !!dbUser.two_factor_enabled
           : is2FAActive;
-      const sec = dbUser.data?.twoFactorSecret || dbUser.two_factor_secret || saved2FASecret;
+      const sec = parsedData.twoFactorSecret || dbUser.data?.twoFactorSecret || dbUser.two_factor_secret || saved2FASecret;
       const resolvedAvatar =
-        dbUser.avatar_url || dbUser.data?.avatarUrl || savedAvatar || undefined;
+        dbUser.avatar_url || parsedData.avatarUrl || dbUser.data?.avatarUrl || savedAvatar || undefined;
       const resolvedName =
-        dbUser.name || dbUser.data?.name || savedName || cleanEmail.split('@')[0];
+        dbUser.name || parsedData.name || dbUser.data?.name || savedName || cleanEmail.split('@')[0];
 
       if (resolvedAvatar) {
         await AsyncStorage.setItem(`clickrypt_avatar_${cleanEmail}`, resolvedAvatar);
       }
 
       const rawEncKey =
-        dbUser.data?.encryptedPrivateKey || dbUser.encrypted_private_key;
+        parsedData.encryptedPrivateKey ||
+        parsedData.encrypted_private_key ||
+        parsedData.privateKey ||
+        parsedData.private_key ||
+        dbUser.data?.encryptedPrivateKey ||
+        dbUser.data?.encrypted_private_key ||
+        dbUser.encrypted_private_key ||
+        dbUser.private_key ||
+        dbUser.data?.privateKey ||
+        dbUser.encryptedPrivateKey;
 
       const userObj: UserProfile = {
         id: dbUser.id,
         authId: dbUser.auth_id,
         email: dbUser.email,
         name: resolvedName,
-        role: dbUser.data?.role || 'Owner',
+        role: parsedData.role || dbUser.data?.role || 'Owner',
         accountMode: dbUser.account_mode || 'personal',
-        publicKey: dbUser.data?.publicKey || dbUser.public_key,
+        publicKey: parsedData.publicKey || dbUser.data?.publicKey || dbUser.public_key,
         encryptedPrivateKey: rawEncKey,
         avatarUrl: resolvedAvatar,
         twoFactorEnabled: has2FA,
@@ -147,51 +175,43 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       }
 
       setStartupState('DECRYPTING_CREDENTIALS');
-      let unlockedKey: string | null = null;
-      let passwordToStore: string | null = null;
-      const passToUse =
-        providedPassword || (await AsyncStorage.getItem('clickrypt_master_password'));
+      let unlockedKey: string | null = getSessionUnlockedKey();
 
-      // Avoid re-running the expensive PGP KDF on every launch if we already
-      // have a cached, unlocked copy of this exact encrypted key.
-      const [cachedUnlocked, cachedKeySource] = await Promise.all([
-        AsyncStorage.getItem('clickrypt_unlocked_pgp_key'),
-        AsyncStorage.getItem('clickrypt_unlocked_key_source'),
-      ]);
-
-      if (rawEncKey && cachedUnlocked && cachedKeySource === rawEncKey) {
-        unlockedKey = cachedUnlocked;
-        passwordToStore = passToUse || (await AsyncStorage.getItem('clickrypt_master_password'));
-        // Don't overwrite a real stored password with an empty string — that
-        // would silently lock the user out of decryption on next launch.
-        if (passwordToStore) {
-          await AsyncStorage.setItem('clickrypt_master_password', passwordToStore);
-        }
-        console.log('[Auth] credentials reused from cache', { timestamp: Date.now() });
-      } else if (passToUse && rawEncKey) {
+      if (providedPassword && rawEncKey) {
+        const cleanPass = providedPassword.trim();
         try {
-          const unlocked = await unprotectPrivateKey(rawEncKey, passToUse);
+          const unlocked = await unprotectPrivateKey(rawEncKey, cleanPass);
           if (unlocked) {
             unlockedKey = unlocked;
-            passwordToStore = passToUse;
-            await AsyncStorage.setItem('clickrypt_unlocked_pgp_key', unlocked);
-            await AsyncStorage.setItem('clickrypt_master_password', passToUse);
-            await AsyncStorage.setItem('clickrypt_unlocked_key_source', rawEncKey);
+            setSessionUnlockedKey(unlocked);
+            setIsVaultUnlocked(true);
             console.log('[Auth] credentials decrypted', { success: true, timestamp: Date.now() });
           }
         } catch {
-          console.log('[Auth] credentials decrypted', { success: false, timestamp: Date.now() });
+          if (cleanPass !== providedPassword) {
+            try {
+              const unlocked = await unprotectPrivateKey(rawEncKey, providedPassword);
+              if (unlocked) {
+                unlockedKey = unlocked;
+                setSessionUnlockedKey(unlocked);
+                setIsVaultUnlocked(true);
+                console.log('[Auth] credentials decrypted', { success: true, timestamp: Date.now() });
+              }
+            } catch {
+              console.log('[Auth] credentials decrypted', { success: false, timestamp: Date.now() });
+            }
+          } else {
+            console.log('[Auth] credentials decrypted', { success: false, timestamp: Date.now() });
+          }
         }
       } else {
-        console.log('[Auth] credentials decrypted', { success: !!passToUse, hasKey: !!rawEncKey, timestamp: Date.now() });
+        console.log('[Auth] credentials preserved from in-memory session', {
+          hasKey: !!unlockedKey,
+          timestamp: Date.now(),
+        });
       }
 
-      // Skip setUser if the profile data is unchanged. AuthContext replaces
-      // the user OBJECT on every realtime echo / background rehydration even
-      // though the actual fields are identical. Each new object identity
-      // cascades into VaultContext (useCallback deps) and tears down realtime
-      // subscriptions + re-fires the full vault sync. Shallow-comparing the
-      // relevant fields breaks that cascade at its source.
+      // Skip setUser if the profile data is unchanged.
       const prev = user;
       const isUnchanged =
         prev &&
@@ -207,8 +227,6 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       if (!isUnchanged) {
         setUser(userObj);
       }
-      setMasterPassword(passwordToStore);
-      setUnlockedPgpKey(unlockedKey);
       setCredentialsResolved(true);
       await AsyncStorage.setItem('clickrypt_cached_user', JSON.stringify(userObj));
 
@@ -225,16 +243,19 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       setCredentialsResolved(false);
       setStartupState('INITIALIZING');
 
-      const [savedMode, savedPass, savedUnlocked, cachedUserStr] = await Promise.all([
+      const [savedMode, cachedUserStr] = await Promise.all([
         AsyncStorage.getItem('clickrypt_app_mode'),
-        AsyncStorage.getItem('clickrypt_master_password'),
-        AsyncStorage.getItem('clickrypt_unlocked_pgp_key'),
         AsyncStorage.getItem('clickrypt_cached_user'),
       ]);
 
+      // Proactively purge any legacy plaintext keys or passwords from persistent storage
+      AsyncStorage.multiRemove([
+        'clickrypt_master_password',
+        'clickrypt_unlocked_pgp_key',
+        'clickrypt_unlocked_key_source',
+      ]).catch(() => {});
+
       if (savedMode) setAppModeState(savedMode as 'personal' | 'organization');
-      if (savedPass) setMasterPassword(savedPass);
-      if (savedUnlocked) setUnlockedPgpKey(savedUnlocked);
 
       let cachedUser: UserProfile | null = null;
       if (cachedUserStr) {
@@ -308,7 +329,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
             if (dbUser) {
               setStartupState('DATABASE_READY');
-              await hydrateUserRecord(dbUser, savedPass);
+              await hydrateUserRecord(dbUser);
               setStartupState('READY');
             } else {
               setStartupState('READY');
@@ -368,7 +389,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
               'user_profile_sync lookup'
             );
             if (dbUser) {
-              await hydrateUserRecord(dbUser, masterPassword);
+              await hydrateUserRecord(dbUser);
             }
           } catch {
             // ignore — transient network issue
@@ -384,7 +405,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         // ignore
       }
     };
-  }, [user?.email, masterPassword]);
+  }, [user?.email]);
 
   const refreshUserProfile = async () => {
     if (!user?.email) return;
@@ -399,7 +420,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         'refresh user-profile-cache'
       );
       if (!error && data?.dbUser) {
-        await hydrateUserRecord(data.dbUser, masterPassword);
+        await hydrateUserRecord(data.dbUser);
         return;
       }
     } catch {
@@ -417,7 +438,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         'refresh users lookup'
       );
       if (dbUser) {
-        await hydrateUserRecord(dbUser, masterPassword);
+        await hydrateUserRecord(dbUser);
       }
     } catch {}
   };
@@ -475,8 +496,8 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     return verifyTOTPCode(secret, inputCode);
   };
 
-  const toggleAccount2FA = async (enable: boolean, secret?: string): Promise<boolean> => {
-    if (!user) return false;
+  const toggleAccount2FA = async (enable: boolean, secret?: string): Promise<AuthResult> => {
+    if (!user) return { success: false, code: 'USER_NOT_FOUND', error: 'No active session found.' };
     try {
       const cleanEmail = (user.email || '').toLowerCase().trim();
       const finalSecret = enable ? secret || user.twoFactorSecret : undefined;
@@ -512,14 +533,15 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         15000,
         'toggleAccount2FA invalidate cache'
       ).catch(() => {});
-      return true;
-    } catch {
-      return false;
+      return { success: true };
+    } catch (err: any) {
+      return { success: false, code: 'NETWORK_ERROR', error: err?.message || 'Failed to update 2FA configuration' };
     }
   };
 
-  const login = async (email: string, masterPass: string) => {
+  const login = async (email: string, masterPass: string): Promise<AuthResult> => {
     const cleanEmail = email.trim().toLowerCase();
+    const cleanPass = masterPass.trim();
     try {
       setIsLoading(true);
 
@@ -582,21 +604,23 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
             'login recovered user upsert'
           ).catch(() => {});
 
-          let recoveredUnlocked = privateKey;
+          let recoveredUnlocked: string | null = null;
           try {
-            recoveredUnlocked = await unprotectPrivateKey(privateKey, masterPass);
+            recoveredUnlocked = await unprotectPrivateKey(privateKey, cleanPass);
           } catch {
-            // fall back to protected key
+            try {
+              recoveredUnlocked = await unprotectPrivateKey(privateKey, masterPass);
+            } catch {}
+          }
+
+          if (recoveredUnlocked) {
+            setSessionUnlockedKey(recoveredUnlocked);
+            setIsVaultUnlocked(true);
           }
 
           setUser(recoveredUser);
-          setMasterPassword(masterPass);
-          setUnlockedPgpKey(recoveredUnlocked);
           setCredentialsResolved(true);
           await AsyncStorage.setItem('clickrypt_cached_user', JSON.stringify(recoveredUser));
-          await AsyncStorage.setItem('clickrypt_master_password', masterPass);
-          await AsyncStorage.setItem('clickrypt_unlocked_pgp_key', recoveredUnlocked);
-          await AsyncStorage.setItem('clickrypt_unlocked_key_source', privateKey);
           return { success: true };
         }
 
@@ -615,89 +639,181 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         setCredentialsResolved(true);
         return {
           success: false,
+          code: 'USER_NOT_FOUND',
           error: 'No account found with this email. Please register first or check your email/password.',
         };
       }
 
       const userObj = await hydrateUserRecord(dbUser, masterPass);
       if (userObj) {
+        const activeKey = getSessionUnlockedKey();
+        if (!activeKey) {
+          // If the provided master password failed to unlock the user's private key
+          await supabase.auth.signOut().catch(() => {});
+          setUser(null);
+          clearSessionKey();
+          setIsVaultUnlocked(false);
+          return {
+            success: false,
+            code: 'INVALID_MASTER_PASSWORD',
+            error: 'Incorrect Master Password. Please verify your password and try again.',
+          };
+        }
         return { success: true };
       }
-      return { success: false, error: 'Could not load user profile.' };
+      return { success: false, code: 'USER_NOT_FOUND', error: 'Could not load user profile.' };
     } catch (err: any) {
-      return { success: false, error: err?.message || 'Login failed' };
+      return { success: false, code: 'UNKNOWN_ERROR', error: err?.message || 'Login failed' };
     } finally {
       setIsLoading(false);
     }
   };
 
-  const unlockVault = async (passphrase: string): Promise<boolean> => {
+  const unlockVault = async (passphrase: string): Promise<AuthResult> => {
     try {
       const cleanPass = passphrase ? passphrase.trim() : '';
-      let keyToUnlock = user?.encryptedPrivateKey;
-      const targetEmail =
-        user?.email ||
-        (await AsyncStorage.getItem('clickrypt_cached_user').then((s) => (s ? JSON.parse(s).email : null)));
-
-      if (targetEmail) {
-        try {
-          const { data: dbUser } = await withTimeout(
-            supabase
-              .from('users')
-              .select('*')
-              .eq('email', targetEmail.toLowerCase().trim())
-              .maybeSingle(),
-            15000,
-            'unlockVault users lookup'
-          );
-          if (dbUser?.data?.encryptedPrivateKey || dbUser?.encrypted_private_key) {
-            keyToUnlock = dbUser.data?.encryptedPrivateKey || dbUser.encrypted_private_key;
-          }
-        } catch {}
+      if (!cleanPass && !passphrase) {
+        return {
+          success: false,
+          code: 'INVALID_MASTER_PASSWORD',
+          error: 'Please enter your master password.',
+        };
       }
+
+      // 1. Fast local-first key lookup (0ms network latency)
+      let rawData: any = {};
+      if ((user as any)?.data) {
+        if (typeof (user as any).data === 'string') {
+          try { rawData = JSON.parse((user as any).data); } catch {}
+        } else if (typeof (user as any).data === 'object') {
+          rawData = (user as any).data;
+        }
+      }
+
+      let keyToUnlock =
+        user?.encryptedPrivateKey ||
+        rawData?.encryptedPrivateKey ||
+        rawData?.encrypted_private_key ||
+        rawData?.privateKey ||
+        rawData?.private_key ||
+        (user as any)?.encrypted_private_key ||
+        (user as any)?.private_key;
 
       if (!keyToUnlock) {
         const cachedUserStr = await AsyncStorage.getItem('clickrypt_cached_user');
         if (cachedUserStr) {
           try {
             const parsed = JSON.parse(cachedUserStr);
-            keyToUnlock = parsed.encryptedPrivateKey;
+            let parsedInnerData: any = {};
+            if (parsed.data) {
+              if (typeof parsed.data === 'string') {
+                try { parsedInnerData = JSON.parse(parsed.data); } catch {}
+              } else if (typeof parsed.data === 'object') {
+                parsedInnerData = parsed.data;
+              }
+            }
+            keyToUnlock =
+              parsed?.encryptedPrivateKey ||
+              parsed?.encrypted_private_key ||
+              parsed?.privateKey ||
+              parsed?.private_key ||
+              parsedInnerData?.encryptedPrivateKey ||
+              parsedInnerData?.encrypted_private_key ||
+              parsedInnerData?.privateKey ||
+              parsedInnerData?.private_key;
           } catch {}
         }
       }
 
-      if (!keyToUnlock) return false;
-
-      const variants = [
-        passphrase,
-        cleanPass,
-        passphrase ? passphrase.charAt(0).toLowerCase() + passphrase.slice(1) : '',
-        cleanPass ? cleanPass.charAt(0).toLowerCase() + cleanPass.slice(1) : '',
-        passphrase ? passphrase.charAt(0).toUpperCase() + passphrase.slice(1) : '',
-        cleanPass ? cleanPass.charAt(0).toUpperCase() + cleanPass.slice(1) : '',
-      ];
-      const attempts = Array.from(new Set(variants)).filter(Boolean);
-      for (const pass of attempts) {
-        try {
-          const unlocked = await unprotectPrivateKey(keyToUnlock, pass);
-          if (unlocked) {
-            setUnlockedPgpKey(unlocked);
-            setMasterPassword(pass);
-            await AsyncStorage.setItem('clickrypt_unlocked_pgp_key', unlocked);
-            await AsyncStorage.setItem('clickrypt_master_password', pass);
-            return true;
-          }
-        } catch {
-          // continue
+      // 2. Fallback to Supabase ONLY if local storage has no key
+      if (!keyToUnlock) {
+        const targetEmail =
+          user?.email ||
+          (await AsyncStorage.getItem('clickrypt_cached_user').then((s) => (s ? JSON.parse(s)?.email : null)));
+        if (targetEmail) {
+          try {
+            const { data: dbUser } = await withTimeout(
+              supabase
+                .from('users')
+                .select('*')
+                .eq('email', targetEmail.toLowerCase().trim())
+                .maybeSingle(),
+              3000,
+              'unlockVault fallback users lookup'
+            );
+            if (dbUser) {
+              let fallbackData: any = {};
+              if (dbUser.data) {
+                if (typeof dbUser.data === 'string') {
+                  try { fallbackData = JSON.parse(dbUser.data); } catch {}
+                } else if (typeof dbUser.data === 'object') {
+                  fallbackData = dbUser.data;
+                }
+              }
+              keyToUnlock =
+                fallbackData.encryptedPrivateKey ||
+                fallbackData.encrypted_private_key ||
+                fallbackData.privateKey ||
+                fallbackData.private_key ||
+                dbUser.encryptedPrivateKey ||
+                dbUser.encrypted_private_key ||
+                dbUser.private_key ||
+                dbUser.privateKey;
+            }
+          } catch {}
         }
       }
-      return false;
-    } catch {
-      return false;
+
+      if (!keyToUnlock) {
+        return {
+          success: false,
+          code: 'PRIVATE_KEY_MISSING',
+          error: 'Encrypted private key not found on this device.',
+        };
+      }
+
+      // 3. Fast single-pass OpenPGP decryption (~130ms) with automatic key normalization
+      try {
+        const unlocked = await unprotectPrivateKey(keyToUnlock, passphrase);
+        if (unlocked) {
+          setSessionUnlockedKey(unlocked);
+          setIsVaultUnlocked(true);
+          return { success: true };
+        }
+      } catch {
+        if (cleanPass && cleanPass !== passphrase) {
+          try {
+            const unlocked = await unprotectPrivateKey(keyToUnlock, cleanPass);
+            if (unlocked) {
+              setSessionUnlockedKey(unlocked);
+              setIsVaultUnlocked(true);
+              return { success: true };
+            }
+          } catch {}
+        }
+      }
+
+      return {
+        success: false,
+        code: 'INVALID_MASTER_PASSWORD',
+        error: 'Incorrect Master Password. Please try again.',
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        code: 'PRIVATE_KEY_DECRYPT_FAILED',
+        error: err?.message || 'Failed to unlock vault.',
+      };
     }
   };
 
-  const register = async (name: string, email: string, masterPass: string) => {
+  const lockVault = () => {
+    clearSessionKey();
+    clearPrivateKeyCache();
+    setIsVaultUnlocked(false);
+  };
+
+  const register = async (name: string, email: string, masterPass: string): Promise<AuthResult> => {
     const cleanEmail = email.trim().toLowerCase();
     try {
       setIsLoading(true);
@@ -738,21 +854,16 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       // re-run the expensive PGP KDF on every item later.
       let unlockedKey = privateKey;
       try {
-        unlockedKey = await unprotectPrivateKey(privateKey, masterPass);
+        unlockedKey = await unprotectPrivateKey(privateKey, masterPass.trim());
       } catch {
-        // The generated key should always decrypt with the master passphrase,
-        // but fall back to the protected key if something goes wrong.
         unlockedKey = privateKey;
       }
 
+      setSessionUnlockedKey(unlockedKey);
+      setIsVaultUnlocked(true);
       setUser(newUser);
-      setMasterPassword(masterPass);
-      setUnlockedPgpKey(unlockedKey);
       setCredentialsResolved(true);
       await AsyncStorage.setItem('clickrypt_cached_user', JSON.stringify(newUser));
-      await AsyncStorage.setItem('clickrypt_master_password', masterPass);
-      await AsyncStorage.setItem('clickrypt_unlocked_pgp_key', unlockedKey);
-      await AsyncStorage.setItem('clickrypt_unlocked_key_source', privateKey);
 
       // Save to Supabase 'users' table with full fallback compatibility
       const insertPayload: any = {
@@ -782,23 +893,61 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
       return { success: true };
     } catch (err: any) {
-      return { success: false, error: err?.message || 'Registration failed' };
+      return { success: false, code: 'UNKNOWN_ERROR', error: err?.message || 'Registration failed' };
     } finally {
       setIsLoading(false);
     }
   };
 
-  const unlockWithBiometrics = async (): Promise<boolean> => {
+  const unlockWithBiometrics = async (): Promise<AuthResult> => {
     try {
       const hasHardware = await LocalAuthentication.hasHardwareAsync();
-      if (!hasHardware) return false;
+      if (!hasHardware) {
+        return {
+          success: false,
+          code: 'BIOMETRICS_UNAVAILABLE',
+          error: 'Biometric authentication is not supported on this device.',
+        };
+      }
+      const isEnrolled = await LocalAuthentication.isEnrolledAsync();
+      if (!isEnrolled) {
+        return {
+          success: false,
+          code: 'BIOMETRICS_UNAVAILABLE',
+          error: 'No biometrics enrolled on this device.',
+        };
+      }
+
       const result = await LocalAuthentication.authenticateAsync({
         promptMessage: 'Unlock ClickRypt Vault',
         fallbackLabel: 'Use Master Password',
       });
-      return result.success;
-    } catch {
-      return false;
+
+      if (!result.success) {
+        return {
+          success: false,
+          code: 'BIOMETRICS_CANCELLED',
+          error: 'Biometric authentication was cancelled.',
+        };
+      }
+
+      // Check if session key is already resident in memory
+      if (isVaultSessionUnlocked()) {
+        setIsVaultUnlocked(true);
+        return { success: true };
+      }
+
+      return {
+        success: false,
+        code: 'UNLOCKED_KEY_MISSING',
+        error: 'Vault session expired. Please enter your Master Password to unlock.',
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        code: 'UNKNOWN_ERROR',
+        error: err?.message || 'Biometric authentication failed.',
+      };
     }
   };
 
@@ -864,8 +1013,9 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       'switchModeAndLogout signOut'
     ).catch(() => {});
     setUser(null);
-    setMasterPassword(null);
-    setUnlockedPgpKey(null);
+    clearSessionKey();
+    clearPrivateKeyCache();
+    setIsVaultUnlocked(false);
     await AsyncStorage.multiRemove([
       'clickrypt_cached_user',
       'clickrypt_master_password',
@@ -882,8 +1032,9 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       'logout signOut'
     ).catch(() => {});
     setUser(null);
-    setMasterPassword(null);
-    setUnlockedPgpKey(null);
+    clearSessionKey();
+    clearPrivateKeyCache();
+    setIsVaultUnlocked(false);
     await AsyncStorage.multiRemove([
       'clickrypt_cached_user',
       'clickrypt_master_password',
@@ -906,11 +1057,6 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       const userEmail = (user.email || '').toLowerCase().trim();
       const userId = user.id || '';
 
-      // The actual deletion runs in a service-role edge function. The mobile
-      // app cannot delete the Supabase Auth user with the anon key, and the
-      // existing client-side deletes were silently failing due to RLS gaps
-      // (owner_id only, not data->>ownerId) and not actually removing the
-      // account from Supabase Auth.
       const { data, error } = await withTimeout(
         supabase.functions.invoke('delete-account', { body: {} }),
         30000,
@@ -940,7 +1086,6 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         };
       }
 
-      // Only purge local state after the server confirmed the account is gone.
       const keysToPurge = [
         'clickrypt_cached_user',
         'clickrypt_cached_vault_personal',
@@ -961,13 +1106,13 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       try {
         await supabase.auth.signOut();
       } catch {
-        // ignore — auth user is already deleted, local session is irrelevant
+        // ignore
       }
 
-      // Reset in-memory auth state
       setUser(null);
-      setMasterPassword(null);
-      setUnlockedPgpKey(null);
+      clearSessionKey();
+      clearPrivateKeyCache();
+      setIsVaultUnlocked(false);
 
       return {
         success: true,
@@ -985,8 +1130,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       value={{
         user,
         isAuthenticated: !!user,
-        masterPassword,
-        unlockedPgpKey,
+        isVaultUnlocked,
         appMode,
         setAppMode,
         check2FAStatus,
@@ -995,6 +1139,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         login,
         register,
         unlockVault,
+        lockVault,
         unlockWithBiometrics,
         updateProfile,
         switchModeAndLogout,

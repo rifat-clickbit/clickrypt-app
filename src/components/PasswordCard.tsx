@@ -21,17 +21,14 @@ import {
   LucideShare2 as Share2,
 } from './Icons';
 import { VaultItem } from '../types';
-import AsyncStorage from '@react-native-async-storage/async-storage';
-import { UnlockVaultModal } from './UnlockVaultModal';
 import { useVault } from '../context/VaultContext';
 import { useAuth } from '../context/AuthContext';
 import { useTheme } from '../theme/ThemeContext';
 import {
   decryptSecret,
   isEncryptedCipher,
-  VaultLockedError,
   DecryptionFailedError,
-  isDecryptionKeyAvailable,
+  VaultLockedError,
 } from '../crypto/cryptoEngine';
 
 interface PasswordCardProps {
@@ -57,13 +54,12 @@ export const PasswordCard: React.FC<PasswordCardProps> = ({
 }) => {
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
-  const { user, appMode, unlockVault, unlockedPgpKey, masterPassword } = useAuth();
+  const { user, appMode, isVaultUnlocked } = useAuth();
   const { revealPassword, refreshVault, revokeSharing, restoreItem, purgeItem } = useVault();
   const [isExpanded, setIsExpanded] = useState(initialExpanded);
   const [isRevealed, setIsRevealed] = useState(false);
   const [isRevealing, setIsRevealing] = useState(false);
   const [revealError, setRevealError] = useState<string | null>(null);
-  const [showUnlockModal, setShowUnlockModal] = useState(false);
   const [decryptedText, setDecryptedText] = useState('');
   const [isCopied, setIsCopied] = useState(false);
   const [isNoteCopied, setIsNoteCopied] = useState(false);
@@ -96,75 +92,33 @@ export const PasswordCard: React.FC<PasswordCardProps> = ({
       return;
     }
 
-    const activeKey = unlockedPgpKey || (await AsyncStorage.getItem('clickrypt_unlocked_pgp_key'));
-    const activePass = masterPassword || (await AsyncStorage.getItem('clickrypt_master_password'));
-
-    if (!isDecryptionKeyAvailable(activeKey, activePass, user?.encryptedPrivateKey)) {
-      setShowUnlockModal(true);
-      return;
-    }
-
     setIsRevealing(true);
     setRevealError(null);
     try {
       const secret = await revealPassword(item);
       if (secret && !isEncryptedCipher(secret)) {
         setDecryptedText(secret);
+        setRevealError(null);
         setIsRevealed(true);
+      } else {
+        setRevealError('Unable to decrypt this password.');
+        setIsRevealed(false);
       }
     } catch (err: any) {
       if (err instanceof VaultLockedError) {
-        setShowUnlockModal(true);
+        setRevealError('Vault is locked. Unlock your vault to reveal credentials.');
       } else if (err instanceof DecryptionFailedError) {
-        setRevealError('This item\'s encrypted data is corrupted or was created by an older app version. Tap "Re-save" to re-enter the password.');
-        setIsRevealed(false);
+        setRevealError('This item\'s encrypted data is corrupted or uses an older key. Tap "Re-save" to update.');
       } else {
-        setRevealError('Unable to decrypt this item. Tap "Re-save" to re-enter the password.');
-        setIsRevealed(false);
+        setRevealError(err?.message || 'Unable to decrypt this password.');
       }
+      setIsRevealed(false);
     } finally {
       setIsRevealing(false);
     }
   };
 
-  const handleUnlockSubmit = async (pass: string) => {
-    const ok = await unlockVault(pass);
-    if (ok) {
-      setShowUnlockModal(false);
-      setIsRevealing(true);
-      setRevealError(null);
-      try {
-        const secret = await revealPassword(item);
-        if (secret && !isEncryptedCipher(secret)) {
-          setDecryptedText(secret);
-          setIsRevealed(true);
-        }
-      } catch (err: any) {
-        if (err instanceof VaultLockedError) {
-          setShowUnlockModal(true);
-        } else if (err instanceof DecryptionFailedError) {
-          setRevealError('This item\'s encrypted data is corrupted or was created by an older app version. Tap "Re-save" to re-enter the password.');
-          setIsRevealed(false);
-        } else {
-          setRevealError('Unable to decrypt this item. Tap "Re-save" to re-enter the password.');
-          setIsRevealed(false);
-        }
-      } finally {
-        setIsRevealing(false);
-      }
-      refreshVault().catch(() => {});
-      return true;
-    }
-    return false;
-  };
-
   const handleCopy = async () => {
-    const activeKey = unlockedPgpKey || (await AsyncStorage.getItem('clickrypt_unlocked_pgp_key'));
-    const activePass = masterPassword || (await AsyncStorage.getItem('clickrypt_master_password'));
-    if (!isDecryptionKeyAvailable(activeKey, activePass, user?.encryptedPrivateKey)) {
-      setShowUnlockModal(true);
-      return;
-    }
     try {
       const secret = decryptedText || item.decryptedPassword || item.noteContent || (await revealPassword(item));
       if (secret) {
@@ -172,10 +126,8 @@ export const PasswordCard: React.FC<PasswordCardProps> = ({
         setIsCopied(true);
         setTimeout(() => setIsCopied(false), 2000);
       }
-    } catch (err: any) {
-      if (err instanceof VaultLockedError) {
-        setShowUnlockModal(true);
-      }
+    } catch {
+      // ignore
     }
   };
 
@@ -583,14 +535,6 @@ export const PasswordCard: React.FC<PasswordCardProps> = ({
           )}
         </View>
       )}
-
-      <UnlockVaultModal
-        isOpen={showUnlockModal}
-        onClose={() => setShowUnlockModal(false)}
-        onSubmit={handleUnlockSubmit}
-        title="Unlock Vault"
-        description="Enter your master password to decrypt and view credentials."
-      />
     </View>
   );
 };

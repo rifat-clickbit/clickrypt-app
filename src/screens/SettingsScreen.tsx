@@ -344,10 +344,12 @@ export const SettingsScreen = () => {
 
   const handleToggleBiometrics = async (val: boolean) => {
     if (val) {
-      const success = await unlockWithBiometrics();
-      if (success) {
+      const res = await unlockWithBiometrics();
+      if (res.success) {
         setBiometricsEnabled(true);
         Alert.alert('Biometrics Enabled', 'FaceID / Fingerprint is now active for vault unlock.');
+      } else if (res.error) {
+        Alert.alert('Biometrics Failed', res.error);
       }
     } else {
       setBiometricsEnabled(false);

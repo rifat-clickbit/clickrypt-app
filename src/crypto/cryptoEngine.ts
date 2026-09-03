@@ -15,12 +15,32 @@ export class DecryptionFailedError extends Error {
   }
 }
 
+let sessionUnlockedKey: string | null = null;
+
+export function setSessionUnlockedKey(armoredKey: string | null): void {
+  sessionUnlockedKey = armoredKey || null;
+}
+
+export function getSessionUnlockedKey(): string | null {
+  return sessionUnlockedKey;
+}
+
+export function clearSessionKey(): void {
+  sessionUnlockedKey = null;
+  cachedPrivateKey = null;
+}
+
+export function isVaultSessionUnlocked(): boolean {
+  return !!sessionUnlockedKey && sessionUnlockedKey.includes('-----BEGIN PGP PRIVATE KEY');
+}
+
 export function isDecryptionKeyAvailable(
-  unlockedKey: string | null | undefined,
-  masterPass: string | null | undefined,
+  unlockedKey?: string | null,
+  masterPass?: string | null,
   encryptedPrivateKey?: string
 ): boolean {
-  if (unlockedKey && unlockedKey.includes('-----BEGIN PGP PRIVATE KEY')) return true;
+  const keyToCheck = unlockedKey || sessionUnlockedKey;
+  if (keyToCheck && keyToCheck.includes('-----BEGIN PGP PRIVATE KEY')) return true;
   if (masterPass && encryptedPrivateKey) return true;
   return false;
 }
@@ -55,25 +75,89 @@ export function clearPrivateKeyCache(): void {
   cachedPrivateKey = null;
 }
 
+/**
+ * Normalizes an armored PGP key or encrypted blob:
+ * 1. Strips outer JSON quotes if double-encoded
+ * 2. Unwraps [ENCRYPTED-PRIV-KEY::...] or [PGP-ENCRYPTED-BLOB::...] containers
+ * 3. Decodes base64 if entire string is base64-encoded armored block
+ * 4. Converts literal escape sequences (\\r\\n, \\n, \\r) into standard \n
+ * 5. Normalizes CRLF \r\n to \n
+ * 6. Trims whitespace
+ */
+export function normalizeArmoredKey(raw: string | undefined | null): string {
+  if (!raw || typeof raw !== 'string') return '';
+  let k = raw.trim();
+
+  // Strip JSON wrapping quotes (e.g. "\"-----BEGIN...\"")
+  if ((k.startsWith('"') && k.endsWith('"')) || (k.startsWith("'") && k.endsWith("'"))) {
+    try {
+      const unquoted = JSON.parse(k);
+      if (typeof unquoted === 'string') k = unquoted.trim();
+    } catch {
+      k = k.slice(1, -1).trim();
+    }
+  }
+
+  // Unwrap proprietary container wrappers
+  if (
+    k.startsWith('[ENCRYPTED-PRIV-KEY::') ||
+    k.startsWith('[PGP-ENCRYPTED-BLOB::') ||
+    k.startsWith('[RSA-ENCRYPTED-KEY::')
+  ) {
+    const startIdx = k.indexOf('::') + 2;
+    const endIdx = k.endsWith(']') ? k.length - 1 : k.length;
+    const inner = k.slice(startIdx, endIdx);
+    try {
+      const decoded = safeBase64Decode(inner);
+      if (decoded && (decoded.includes('-----BEGIN') || decoded.includes('PRIVATE KEY'))) {
+        k = decoded.trim();
+      }
+    } catch {}
+  }
+
+  // If the raw string is pure base64 without armor markers, try decoding
+  if (!k.includes('-----BEGIN') && /^[A-Za-z0-9+/=\s\r\n]+$/.test(k) && k.length > 50) {
+    try {
+      const decoded = safeBase64Decode(k);
+      if (decoded && decoded.includes('-----BEGIN')) {
+        k = decoded.trim();
+      }
+    } catch {}
+  }
+
+  // Convert literal string escape sequences to real newlines
+  k = k.replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n').replace(/\\r/g, '\n');
+
+  // Normalize CRLF to LF
+  k = k.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+  return k.trim();
+}
+
 export async function getUnlockedPrivateKey(
   privateKeyArmored: string,
   passphrase?: string
 ): Promise<any> {
   const openpgp = await getOpenpgp();
-  const trimmedKey = (privateKeyArmored || '').trim();
+  const cleanArmoredKey = normalizeArmoredKey(privateKeyArmored);
 
-  if (cachedPrivateKey?.rawArmored === trimmedKey) {
+  if (!cleanArmoredKey) {
+    throw new Error('No valid private key armored text provided');
+  }
+
+  if (cachedPrivateKey?.rawArmored === cleanArmoredKey) {
     if (cachedPrivateKey.isDecrypted) {
       return cachedPrivateKey.key;
     }
     if (passphrase) {
       try {
+        const freshKey = await openpgp.readPrivateKey({ armoredKey: cleanArmoredKey });
         const decrypted = await openpgp.decryptKey({
-          privateKey: cachedPrivateKey.key,
+          privateKey: freshKey,
           passphrase,
         });
         if (decrypted && (typeof decrypted.isDecrypted !== 'function' || decrypted.isDecrypted())) {
-          cachedPrivateKey = { rawArmored: trimmedKey, key: decrypted, isDecrypted: true };
+          cachedPrivateKey = { rawArmored: cleanArmoredKey, key: decrypted, isDecrypted: true };
           return decrypted;
         }
       } catch {
@@ -84,7 +168,7 @@ export async function getUnlockedPrivateKey(
   }
 
   let privateKey = await openpgp.readPrivateKey({
-    armoredKey: trimmedKey,
+    armoredKey: cleanArmoredKey,
   });
 
   if (typeof privateKey.isDecrypted === 'function' && !privateKey.isDecrypted() && passphrase) {
@@ -100,7 +184,7 @@ export async function getUnlockedPrivateKey(
 
   const isDec = typeof privateKey.isDecrypted === 'function' ? privateKey.isDecrypted() : true;
   cachedPrivateKey = {
-    rawArmored: trimmedKey,
+    rawArmored: cleanArmoredKey,
     key: privateKey,
     isDecrypted: isDec,
   };
@@ -344,12 +428,14 @@ export async function decryptWithPrivateKey(
     return encryptedData;
   }
 
-  if (!privateKeyArmored) return encryptedData;
+  const effectiveKey = privateKeyArmored || sessionUnlockedKey;
+  if (!effectiveKey) return encryptedData;
 
   try {
     const openpgp = await getOpenpgp();
-    const privateKey = await getUnlockedPrivateKey(privateKeyArmored, passphrase);
-    const message = await openpgp.readMessage({ armoredMessage: trimmed });
+    const cleanCipher = normalizeArmoredKey(trimmed);
+    const privateKey = await getUnlockedPrivateKey(effectiveKey, passphrase);
+    const message = await openpgp.readMessage({ armoredMessage: cleanCipher });
     const { data: decrypted } = await openpgp.decrypt({
       message,
       decryptionKeys: privateKey,
@@ -419,20 +505,38 @@ export async function unprotectPrivateKey(
   privateKeyArmored: string,
   passphrase: string
 ): Promise<string> {
-  if (!privateKeyArmored || typeof privateKeyArmored !== 'string') {
+  const cleanArmoredKey = normalizeArmoredKey(privateKeyArmored);
+  if (!cleanArmoredKey) {
     throw new Error('No private key provided');
   }
-  const privateKey = await getUnlockedPrivateKey(privateKeyArmored, passphrase);
-  if (typeof privateKey.isDecrypted === 'function' && privateKey.isDecrypted()) {
-    return privateKey.armor();
+
+  const openpgp = await getOpenpgp();
+  const cleanPass = passphrase ? passphrase.trim() : '';
+
+  // 1. Try with the exact provided passphrase
+  try {
+    const key = await openpgp.readPrivateKey({ armoredKey: cleanArmoredKey });
+    if (typeof key.isDecrypted === 'function' && key.isDecrypted()) {
+      cachedPrivateKey = { rawArmored: cleanArmoredKey, key, isDecrypted: true };
+      return key.armor();
+    }
+    const decrypted = await openpgp.decryptKey({ privateKey: key, passphrase });
+    if (decrypted && (typeof decrypted.isDecrypted !== 'function' || decrypted.isDecrypted())) {
+      cachedPrivateKey = { rawArmored: cleanArmoredKey, key: decrypted, isDecrypted: true };
+      return decrypted.armor();
+    }
+  } catch {
+    // Try cleanPass fallback if different
   }
 
-  const cleanPass = passphrase ? passphrase.trim() : '';
+  // 2. Try with trimmed passphrase if different from raw
   if (cleanPass && cleanPass !== passphrase) {
     try {
-      const unlocked = await getUnlockedPrivateKey(privateKeyArmored, cleanPass);
-      if (typeof unlocked.isDecrypted === 'function' && unlocked.isDecrypted()) {
-        return unlocked.armor();
+      const key = await openpgp.readPrivateKey({ armoredKey: cleanArmoredKey });
+      const decrypted = await openpgp.decryptKey({ privateKey: key, passphrase: cleanPass });
+      if (decrypted && (typeof decrypted.isDecrypted !== 'function' || decrypted.isDecrypted())) {
+        cachedPrivateKey = { rawArmored: cleanArmoredKey, key: decrypted, isDecrypted: true };
+        return decrypted.armor();
       }
     } catch {
       // ignore

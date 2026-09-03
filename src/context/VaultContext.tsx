@@ -24,6 +24,7 @@ import {
   VaultLockedError,
   DecryptionFailedError,
   isDecryptionKeyAvailable,
+  getSessionUnlockedKey,
 } from '../crypto/cryptoEngine';
 import { checkPasswordBreach } from '../services/breachScanner';
 import { queueMutation } from '../services/offlineQueue';
@@ -125,8 +126,6 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
   const {
     user,
     appMode,
-    masterPassword,
-    unlockedPgpKey,
     credentialsResolved,
   } = useAuth();
 
@@ -159,6 +158,11 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
     userRef.current = user;
   }, [user]);
 
+  const itemsRef = useRef<VaultItem[]>([]);
+  useEffect(() => {
+    itemsRef.current = items;
+  }, [items]);
+
   const invalidateVaultCache = useCallback(async () => {
     if (!user) return;
     await withTimeout(
@@ -174,6 +178,7 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
     (async () => {
       const cached = await loadCachedVault(appMode);
       if (isMounted && cached.length > 0) {
+        itemsRef.current = cached;
         setItems(cached);
         setRawItems(cached);
       }
@@ -193,7 +198,10 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
       isFetchingRef.current = true;
       pendingFetchRef.current = false;
 
-      if (showLoading) setIsLoading(true);
+      // Only show full loading spinner if there are NO items in memory/cache
+      if (showLoading && itemsRef.current.length === 0) {
+        setIsLoading(true);
+      }
       setIsSyncing(true);
 
       try {
@@ -995,16 +1003,9 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
         return commitDecrypted(item.decryptedPassword);
       }
 
-      const activeKey =
-        unlockedPgpKey ||
-        (await AsyncStorage.getItem('clickrypt_unlocked_pgp_key'));
-      const activePass =
-        masterPassword ||
-        (await AsyncStorage.getItem('clickrypt_master_password'));
-
-      const hasKey = isDecryptionKeyAvailable(activeKey, activePass, user.encryptedPrivateKey);
-      if (!hasKey) {
-        console.warn('[Vault] revealPassword: no decryption key available for item', item.id);
+      const activeKey = getSessionUnlockedKey();
+      if (!activeKey || !isDecryptionKeyAvailable(activeKey)) {
+        console.warn('[Vault] revealPassword: no in-memory session key available for item', item.id);
         throw new VaultLockedError();
       }
 
@@ -1034,12 +1035,11 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
         (item as any).encrypted_symmetric_key ||
         (item as any).data?.encryptedSymmetricKey;
 
-      if (encSymKey && (activeKey || activePass)) {
+      if (encSymKey && activeKey) {
         try {
           const unwrappedKey = await decryptWithPrivateKey(
             encSymKey,
-            activeKey || user.encryptedPrivateKey,
-            activePass || undefined
+            activeKey
           );
           if (unwrappedKey && rawBlob) {
             // unwrappedKey is a symmetric key string, not a PGP key, so it
@@ -1075,8 +1075,7 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
         if (shareData?.encrypted_symmetric_key) {
           const decryptedSymKey = await decryptWithPrivateKey(
             shareData.encrypted_symmetric_key,
-            activeKey || user.encryptedPrivateKey,
-            activePass || undefined
+            activeKey
           );
           const decrypted = rawBlob
             ? await decryptSecret(rawBlob, undefined, decryptedSymKey)
@@ -1100,8 +1099,7 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
         try {
           const decrypted = await decryptSecret(
             rawBlob,
-            activeKey || user.encryptedPrivateKey,
-            activePass || undefined
+            activeKey
           );
 
           if (
@@ -1147,7 +1145,7 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
         'Unable to decrypt this item. The stored secret may be damaged or the encryption key does not match.'
       );
     },
-    [appMode, masterPassword, unlockedPgpKey, user]
+    [appMode, user]
   );
 
   const shareItemWithMember = useCallback(
@@ -1178,15 +1176,10 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
         }
 
         // To unwrap the owner's key we need the owner's private key available.
-        const activeKey =
-          unlockedPgpKey ||
-          (await AsyncStorage.getItem('clickrypt_unlocked_pgp_key'));
-        const activePass =
-          masterPassword ||
-          (await AsyncStorage.getItem('clickrypt_master_password'));
+        const activeKey = getSessionUnlockedKey();
 
-        if (!isDecryptionKeyAvailable(activeKey, activePass, user.encryptedPrivateKey)) {
-          console.warn('[Vault] shareItemWithMember: no decryption key available for item', target.id);
+        if (!activeKey || !isDecryptionKeyAvailable(activeKey)) {
+          console.warn('[Vault] shareItemWithMember: no session decryption key available for item', target.id);
           return false;
         }
 
@@ -1199,8 +1192,7 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
           try {
             const itemSymmetricKey = await decryptWithPrivateKey(
               target.encryptedSymmetricKey,
-              activeKey || user.encryptedPrivateKey,
-              activePass || undefined
+              activeKey
             );
             if (itemSymmetricKey && !isEncryptedCipher(itemSymmetricKey)) {
               reEncryptedKey = await encryptWithPublicKey(
@@ -1218,10 +1210,6 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
         }
 
         // Legacy fallback for items created before the symmetric-key scheme:
-        // encrypt the plaintext secret directly with the recipient's public key.
-        // This is what the previous implementation did and is not decryptable
-        // by the modern reveal path, but it preserves existing behavior for old
-        // data until the item is re-encrypted.
         if (!reEncryptedKey) {
           console.warn(
             '[Vault] shareItemWithMember: item has no wrapped symmetric key; sharing as legacy encrypted-secret',
@@ -1286,7 +1274,7 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
         return false;
       }
     },
-    [appMode, items, masterPassword, revealPassword, unlockedPgpKey, updateItem, user]
+    [appMode, items, revealPassword, updateItem, user]
   );
 
   const revokeSharing = useCallback(

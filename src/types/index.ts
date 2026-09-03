@@ -7,6 +7,33 @@ export type AppStartupState =
   | 'READY'
   | 'ERROR';
 
+export type AuthErrorCode =
+  | 'INVALID_MASTER_PASSWORD'
+  | 'VAULT_LOCKED'
+  | 'UNLOCKED_KEY_MISSING'
+  | 'PRIVATE_KEY_MISSING'
+  | 'PRIVATE_KEY_DECRYPT_FAILED'
+  | 'BIOMETRICS_UNAVAILABLE'
+  | 'BIOMETRICS_CANCELLED'
+  | 'RESOURCE_KEY_UNWRAP_FAILED'
+  | 'RESOURCE_DECRYPT_FAILED'
+  | 'USER_NOT_FOUND'
+  | 'NETWORK_ERROR'
+  | 'UNKNOWN_ERROR';
+
+export interface AuthResult {
+  success: boolean;
+  error?: string;
+  code?: AuthErrorCode;
+}
+
+export type MasterPassword = string;
+export type EncryptedPrivateKey = string;
+export type UnlockedPrivateKey = string;
+export type SymmetricKey = string;
+export type EncryptedSymmetricKey = string;
+export type TOTPSecret = string;
+
 export interface PasswordDiagnosticLog {
   passwordRecordFound: boolean;
   encryptedPasswordPresent: boolean;
