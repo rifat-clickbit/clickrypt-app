@@ -11,7 +11,7 @@ import {
 import { colors } from '../theme/colors';
 import { Header } from '../components/Header';
 import { PasswordDrawerModal } from '../components/PasswordDrawerModal';
-import { NavCardsIcon, EyeIcon, CopyIcon, TrashIcon } from '../components/Icons';
+import { NavCardsIcon, EyeIcon, EyeOffIcon, CopyIcon, TrashIcon } from '../components/Icons';
 import * as Clipboard from 'expo-clipboard';
 import { useVault } from '../context/VaultContext';
 import { useTheme } from '../theme/ThemeContext';
@@ -163,7 +163,11 @@ export const CardsScreen = () => {
                       style={styles.miniBtn}
                       onPress={() => toggleReveal(card)}
                     >
-                      <EyeIcon size={12} color={colors.textSecondary} />
+                      {isRevealed ? (
+                        <EyeOffIcon size={12} color={colors.cyan} />
+                      ) : (
+                        <EyeIcon size={12} color={colors.textSecondary} />
+                      )}
                     </TouchableOpacity>
                     <TouchableOpacity
                       style={styles.miniBtn}

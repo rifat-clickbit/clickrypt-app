@@ -38,7 +38,7 @@ import * as Clipboard from 'expo-clipboard';
 import { useAuth } from '../context/AuthContext';
 import { useVault } from '../context/VaultContext';
 import { useTheme, ThemeMode } from '../theme/ThemeContext';
-import { generateKeyPair, generateTOTPCode } from '../crypto/cryptoEngine';
+import { generateKeyPair, generateTOTPCode, setSessionUnlockedKey, unprotectPrivateKey } from '../crypto/cryptoEngine';
 import { supabase } from '../services/supabaseClient';
 import { setScreenProtection, getScreenProtectionState } from '../services/screenProtection';
 import {
@@ -370,13 +370,26 @@ export const SettingsScreen = () => {
     try {
       if (user?.email) {
         const { privateKey, publicKey } = await generateKeyPair(user.email, newPassword);
+        
+        let unlockedKey = privateKey;
+        try {
+          unlockedKey = await unprotectPrivateKey(privateKey, newPassword.trim());
+        } catch {
+          unlockedKey = privateKey;
+        }
+        setSessionUnlockedKey(unlockedKey);
+
         await supabase.from('users').upsert({
           id: user.id,
           email: user.email,
+          name: user.name,
+          role: user.role,
+          account_mode: user.accountMode,
           data: {
-            ...user,
             publicKey,
             encryptedPrivateKey: privateKey,
+            twoFactorEnabled: user.twoFactorEnabled,
+            avatarUrl: user.avatarUrl,
           },
         });
         await supabase.auth.updateUser({ password: newPassword }).catch(() => {});
