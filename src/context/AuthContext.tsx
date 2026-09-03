@@ -806,13 +806,18 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     setIsVaultUnlocked(false);
   };
 
+  const isValidUuid = (id?: string | null): boolean => {
+    if (!id || typeof id !== 'string') return false;
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+  };
+
   const register = async (name: string, email: string, masterPass: string): Promise<AuthResult> => {
     const cleanEmail = email.trim().toLowerCase();
     try {
       setIsLoading(true);
       const { privateKey, publicKey } = await generateKeyPair(cleanEmail, masterPass);
 
-      // Attempt Supabase Auth signup
+      // Attempt Supabase Auth signup (short 4s timeout, gracefully falls back if rate-limited)
       let authId: string | undefined = undefined;
       try {
         const { data: authData } = await withTimeout(
@@ -823,10 +828,12 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
               data: { name, publicKey, encryptedPrivateKey: privateKey },
             },
           }),
-          25000,
+          4000,
           'register signUp'
         );
-        authId = authData?.user?.id;
+        if (authData?.user?.id && isValidUuid(authData.user.id)) {
+          authId = authData.user.id;
+        }
       } catch {
         // Fall back to direct profile creation in public.users
       }
@@ -836,7 +843,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
       const newUser: UserProfile = {
         id: `usr-${Date.now()}`,
-        authId: authId || `auth-${Date.now()}`,
+        authId: isValidUuid(authId) ? authId : undefined,
         email: cleanEmail,
         name: name.trim(),
         role: 'Owner',
@@ -865,11 +872,11 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       // Save to Supabase 'users' table with full fallback compatibility
       const insertPayload: any = {
         id: newUser.id,
-        auth_id: newUser.authId,
+        auth_id: isValidUuid(authId) ? authId : null,
         email: cleanEmail,
         name: newUser.name,
+        role: 'Owner',
         account_mode: appMode,
-        organization_id: orgId,
         data: {
           ...newUser,
           publicKey,
@@ -879,7 +886,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
       await withTimeout(
         supabase.from('users').upsert(insertPayload),
-        20000,
+        5000,
         'register users upsert'
       );
 
@@ -908,11 +915,8 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         }
       }
 
-      await withTimeout(
-        supabase.functions.invoke('user-profile-cache-invalidate', { body: {} }),
-        15000,
-        'register invalidate cache'
-      ).catch(() => {});
+      // Non-blocking cache invalidation
+      supabase.functions.invoke('user-profile-cache-invalidate', { body: {} }).catch(() => {});
 
       return { success: true };
     } catch (err: any) {
