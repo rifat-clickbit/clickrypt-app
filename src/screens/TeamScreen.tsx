@@ -132,11 +132,20 @@ export const TeamScreen = () => {
   const fetchData = async (showLoading = true) => {
     if (showLoading) setLoading(true);
     try {
-      // 1. Fetch Users
-      const { data: userData } = await supabase.from('users').select('*').limit(50);
+      const userDomain = user?.email && user.email.includes('@') ? user.email.split('@')[1].toLowerCase() : '';
+      const orgId = user?.organizationId;
+
+      // 1. Fetch Users scoped strictly to this organization domain
+      const { data: userData } = await supabase.from('users').select('*');
       let userList: MemberItem[] = [];
       if (userData && userData.length > 0) {
-        userList = userData.map((u: any) => {
+        const scoped = userData.filter((u: any) => {
+          if (userDomain && u.email && u.email.toLowerCase().endsWith('@' + userDomain)) return true;
+          if (orgId && (u.organization_id === orgId || u.data?.organizationId === orgId || u.data?.managedByOrganizationId === orgId)) return true;
+          return false;
+        });
+
+        userList = scoped.map((u: any) => {
           const name = u.name || u.data?.name || u.email?.split('@')[0] || 'Member';
           const initials = name
             .split(' ')
@@ -149,9 +158,9 @@ export const TeamScreen = () => {
             id: u.id,
             name,
             email: u.email || 'user@clickbit.com.au',
-            role: u.data?.role || u.role || 'Member',
+            role: u.role || u.data?.role || 'Member',
             initials: initials || 'US',
-            status: u.data?.status || 'Active',
+            status: u.status || u.data?.status || 'Active',
           };
         });
       }
@@ -198,24 +207,40 @@ export const TeamScreen = () => {
   };
 
   const handleCreateInvite = async () => {
+    if (user?.role !== 'Owner' && user?.role !== 'Admin') {
+      Alert.alert('Permission Denied', 'Only Organization Owners and Admins can invite team members.');
+      return;
+    }
+
     if (!inviteEmail.trim()) {
       Alert.alert('Email Required', 'Please enter work email address to invite.');
       return;
     }
 
+    const userDomain = user?.email && user.email.includes('@') ? user.email.split('@')[1].toLowerCase() : '';
+    const cleanInviteEmail = inviteEmail.trim().toLowerCase();
+
+    if (userDomain && !cleanInviteEmail.endsWith('@' + userDomain)) {
+      Alert.alert(
+        'Domain Mismatch',
+        `Invited colleagues must belong to your organization domain (@${userDomain}).`
+      );
+      return;
+    }
+
     const token = Math.random().toString(36).substring(2, 12);
     const link = `https://clickbit.com.au/join-organization?token=${token}&email=${encodeURIComponent(
-      inviteEmail.trim()
+      cleanInviteEmail
     )}&role=${inviteRole}`;
 
     const orgId = user?.organizationId || (user?.email ? `org-${user.email.split('@')[1].replace(/[^a-z0-9]/g, '')}` : `org-${user?.id}`);
 
     const newMember: MemberItem = {
       id: `usr-inv-${Date.now()}`,
-      name: inviteName.trim() || inviteEmail.split('@')[0],
-      email: inviteEmail.trim().toLowerCase(),
+      name: inviteName.trim() || cleanInviteEmail.split('@')[0],
+      email: cleanInviteEmail,
       role: inviteRole,
-      initials: (inviteName.trim() || inviteEmail).slice(0, 2).toUpperCase(),
+      initials: (inviteName.trim() || cleanInviteEmail).slice(0, 2).toUpperCase(),
       status: 'Invited',
     };
 
@@ -228,14 +253,12 @@ export const TeamScreen = () => {
         id: newMember.id,
         email: newMember.email,
         name: newMember.name,
+        role: inviteRole,
+        status: 'Invited',
         account_mode: 'organization',
         organization_id: orgId,
         managed_by_organization_id: orgId,
         data: {
-          ...newMember,
-          organizationId: orgId,
-          managedByOrganizationId: orgId,
-          status: 'Invited',
           invitedAt: new Date().toISOString(),
           inviteLink: link,
         },
@@ -269,8 +292,14 @@ export const TeamScreen = () => {
   };
 
   const handleCreateGroup = async () => {
+    if (user?.role !== 'Owner' && user?.role !== 'Admin') {
+      Alert.alert('Permission Denied', 'Only Organization Owners and Admins can create groups.');
+      return;
+    }
+
     if (!groupName.trim()) return;
     const currentMemberIds = members.slice(0, 1).map((m) => m.id);
+    const orgId = user?.organizationId || null;
     const newGroup: GroupItem = {
       id: `grp-${Date.now()}`,
       name: groupName.trim(),
@@ -289,8 +318,9 @@ export const TeamScreen = () => {
         id: newGroup.id,
         name: newGroup.name,
         description: newGroup.description,
+        organization_id: orgId,
         created_by: user?.id,
-        data: newGroup,
+        data: { lastActive: 'Just now' },
       });
 
       for (const uid of currentMemberIds) {
@@ -310,6 +340,11 @@ export const TeamScreen = () => {
   };
 
   const handleDeleteGroup = (group: GroupItem) => {
+    if (user?.role !== 'Owner' && user?.role !== 'Admin') {
+      Alert.alert('Permission Denied', 'Only Organization Owners and Admins can delete groups.');
+      return;
+    }
+
     Alert.alert(
       'Delete Group',
       `Are you sure you want to delete the group "${group.name}"? Members and credentials will remain safe.`,

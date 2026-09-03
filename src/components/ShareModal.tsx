@@ -62,15 +62,22 @@ export const ShareModal: React.FC<ShareModalProps> = ({ visible, onClose, item }
 
   const fetchMembers = async () => {
     try {
-      const { data } = await supabase.from('users').select('*').limit(50);
+      const userDomain = user?.email && user.email.includes('@') ? user.email.split('@')[1].toLowerCase() : '';
+      const { data } = await supabase.from('users').select('*');
       if (data && data.length > 0) {
         const filtered = data
-          .filter((u: any) => u.id !== user?.id && u.email !== user?.email)
+          .filter((u: any) => {
+            if (u.id === user?.id || u.email === user?.email) return false;
+            // Only members of the same organization / domain
+            if (userDomain && u.email && u.email.toLowerCase().endsWith('@' + userDomain)) return true;
+            if (user?.organizationId && (u.organization_id === user.organizationId || u.data?.organizationId === user.organizationId)) return true;
+            return false;
+          })
           .map((u: any) => ({
             id: u.id,
             name: u.name || u.data?.name || u.email?.split('@')[0] || 'Team Member',
             email: u.email || '',
-            role: u.data?.role || u.role || 'Member',
+            role: u.role || u.data?.role || 'Member',
           }));
         setTeamMembers(filtered);
       } else {

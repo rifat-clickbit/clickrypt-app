@@ -134,16 +134,34 @@ export const logActivity = async (
     // Background sync to Supabase activity_logs table
     if (userId) {
       Promise.resolve(
-        supabase.from('activity_logs').insert({
-          id: newItem.id,
-          user_id: userId,
-          email_snapshot: email,
-          title,
-          message,
-          category,
-          mode,
-          timestamp: newItem.timestamp,
-        })
+        supabase
+          .from('activity_logs')
+          .insert({
+            id: newItem.id,
+            user_id: userId,
+            user_email: email,
+            action: title,
+            title,
+            message: message || title,
+            details: { message },
+            category,
+            mode,
+            timestamp: newItem.timestamp,
+          })
+          .then(({ error }) => {
+            if (error && (error.message.includes('column') || error.message.includes('schema cache'))) {
+              // Backward-compatible fallback if migration hasn't been applied to remote yet
+              return supabase.from('activity_logs').insert({
+                id: newItem.id,
+                user_id: userId,
+                title,
+                message: message || title,
+                category,
+                mode,
+                timestamp: newItem.timestamp,
+              });
+            }
+          })
       ).catch(() => {});
     }
   } catch {

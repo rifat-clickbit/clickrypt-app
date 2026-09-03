@@ -153,13 +153,15 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         authId: dbUser.auth_id,
         email: dbUser.email,
         name: resolvedName,
-        role: parsedData.role || dbUser.data?.role || 'Owner',
+        role: dbUser.role || parsedData.role || dbUser.data?.role || (dbUser.account_mode === 'organization' ? 'Member' : 'Owner'),
         accountMode: dbUser.account_mode || 'personal',
         publicKey: parsedData.publicKey || dbUser.data?.publicKey || dbUser.public_key,
         encryptedPrivateKey: rawEncKey,
         avatarUrl: resolvedAvatar,
         twoFactorEnabled: has2FA,
         twoFactorSecret: sec,
+        organizationId: dbUser.organization_id || parsedData.organizationId || dbUser.data?.organizationId,
+        managedByOrganizationId: dbUser.managed_by_organization_id || parsedData.managedByOrganizationId || dbUser.data?.managedByOrganizationId,
       };
 
       if (dbUser.account_mode) {
@@ -838,17 +840,45 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         // Fall back to direct profile creation in public.users
       }
 
+      // Check if user was pre-invited to an organization
+      let assignedRole: 'Owner' | 'Admin' | 'Member' | 'Viewer' = appMode === 'organization' ? 'Owner' : 'Owner';
+      let targetUserId = `usr-${Date.now()}`;
       const domain = cleanEmail.includes('@') ? cleanEmail.split('@')[1] : '';
-      const orgId = appMode === 'organization' ? `org-${Date.now()}` : undefined;
+      let orgId = appMode === 'organization' ? `org-${Date.now()}` : undefined;
+      let isManaged = false;
+
+      try {
+        const { data: existingInvite } = await supabase
+          .from('users')
+          .select('*')
+          .eq('email', cleanEmail)
+          .maybeSingle();
+
+        if (existingInvite) {
+          targetUserId = existingInvite.id;
+          if (existingInvite.role && existingInvite.role !== 'User') {
+            assignedRole = existingInvite.role as any;
+          } else if (existingInvite.data?.role) {
+            assignedRole = existingInvite.data.role;
+          } else if (appMode === 'organization') {
+            assignedRole = 'Member';
+          }
+          orgId = existingInvite.organization_id || existingInvite.data?.organizationId || orgId;
+          isManaged = !!existingInvite.managed_by_organization_id || !!existingInvite.data?.managedByOrganizationId;
+        }
+      } catch {
+        // continue with defaults
+      }
 
       const newUser: UserProfile = {
-        id: `usr-${Date.now()}`,
+        id: targetUserId,
         authId: isValidUuid(authId) ? authId : undefined,
         email: cleanEmail,
         name: name.trim(),
-        role: 'Owner',
+        role: assignedRole,
         accountMode: appMode,
         organizationId: orgId,
+        managedByOrganizationId: isManaged ? orgId : undefined,
         publicKey,
         encryptedPrivateKey: privateKey,
         twoFactorEnabled: false,
@@ -869,18 +899,20 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       setCredentialsResolved(true);
       await AsyncStorage.setItem('clickrypt_cached_user', JSON.stringify(newUser));
 
-      // Save to Supabase 'users' table with full fallback compatibility
+      // Save to Supabase 'users' table with full single-source-of-truth columns
       const insertPayload: any = {
         id: newUser.id,
         auth_id: isValidUuid(authId) ? authId : null,
         email: cleanEmail,
         name: newUser.name,
-        role: 'Owner',
+        role: assignedRole,
+        status: 'Active',
         account_mode: appMode,
         data: {
-          ...newUser,
           publicKey,
           encryptedPrivateKey: privateKey,
+          twoFactorEnabled: false,
+          avatarUrl: newUser.avatarUrl,
         },
       };
 
@@ -890,7 +922,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         'register users upsert'
       );
 
-      // If registering in organization mode, register explicit organization & owner membership
+      // If registering in organization mode, register explicit organization & membership
       if (appMode === 'organization' && orgId) {
         try {
           const orgName = domain ? `${domain.split('.')[0].toUpperCase()} Organization` : `${name.trim()}'s Org`;
@@ -898,16 +930,15 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
             id: orgId,
             name: orgName,
             domain: domain || 'company.com',
-            owner_id: newUser.id,
-            data: { name: orgName, domain, ownerId: newUser.id },
+            owner_id: assignedRole === 'Owner' ? newUser.id : undefined,
+            data: { name: orgName, domain, ownerId: assignedRole === 'Owner' ? newUser.id : undefined },
           });
 
           await supabase.from('organization_members').upsert({
-            id: `om-${Date.now()}`,
             organization_id: orgId,
             user_id: newUser.id,
-            role: 'Owner',
-            is_managed_account: false,
+            role: assignedRole,
+            is_managed_account: isManaged,
             status: 'active',
           });
         } catch (orgErr) {

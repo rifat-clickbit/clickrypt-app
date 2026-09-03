@@ -66,8 +66,11 @@ export const FoldersScreen = () => {
     await supabase.from('folders').upsert({
       id: newFolder.id,
       name: newFolder.name,
+      description: newFolder.description || 'Custom folder',
+      color: newFolder.color || '#FBBF24',
       mode: appMode,
       owner_id: user.id,
+      organization_id: user.organizationId || null,
       data: newFolder,
     });
 

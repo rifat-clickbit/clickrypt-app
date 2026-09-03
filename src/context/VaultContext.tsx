@@ -479,14 +479,14 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
         try {
           const { error } = await supabase.from('resources').upsert({
             id: newItem.id,
+            name: newItem.name,
+            category: newItem.itemType || 'login',
             mode: appMode,
             owner_id: user.id,
             folder_id: payload.folderId || null,
+            secrets_data: newItem.secrets,
             data: {
               ...persistableItem(newItem),
-              ownerId: user.id,
-              folderId: payload.folderId || null,
-              itemType,
               encryptedSymmetricKey: encryptedKeyForOwner,
             },
           });
@@ -662,9 +662,13 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
           try {
             const { error } = await supabase.from('resources').upsert({
               id: target.id,
+              name: target.name,
+              category: target.itemType || 'login',
               mode: appMode,
               owner_id: target.ownerId || user.id,
               folder_id: target.folderId ?? null,
+              secrets_data: target.secrets,
+              last_modified: target.lastModified,
               data: persistableItem(target),
             });
             if (error) throw error;
