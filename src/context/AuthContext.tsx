@@ -935,12 +935,13 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
           });
 
           await supabase.from('organization_members').upsert({
+            id: `om-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
             organization_id: orgId,
             user_id: newUser.id,
             role: assignedRole,
             is_managed_account: isManaged,
             status: 'active',
-          });
+          }, { onConflict: 'organization_id,user_id' });
         } catch (orgErr) {
           console.warn('[Auth] organization registration notice:', orgErr);
         }

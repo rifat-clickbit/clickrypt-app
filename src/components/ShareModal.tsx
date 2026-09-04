@@ -67,7 +67,8 @@ export const ShareModal: React.FC<ShareModalProps> = ({ visible, onClose, item }
       if (data && data.length > 0) {
         const filtered = data
           .filter((u: any) => {
-            if (u.id === user?.id || u.email === user?.email) return false;
+            if (u.id === user?.id || (user?.email && u.email?.toLowerCase() === user.email.toLowerCase())) return false;
+            if (item?.ownerId && u.id === item.ownerId) return false;
             // Only members of the same organization / domain
             if (userDomain && u.email && u.email.toLowerCase().endsWith('@' + userDomain)) return true;
             if (user?.organizationId && (u.organization_id === user.organizationId || u.data?.organizationId === user.organizationId)) return true;
@@ -94,6 +95,20 @@ export const ShareModal: React.FC<ShareModalProps> = ({ visible, onClose, item }
       return;
     }
     if (!item) return;
+
+    if (selectedMemberId === user?.id || selectedMemberId === item.ownerId) {
+      Alert.alert('Invalid Selection', 'You cannot share an item with yourself or the owner.');
+      return;
+    }
+
+    const alreadyShared =
+      (item.sharedWith && item.sharedWith.includes(selectedMemberId)) ||
+      (item.sharedWithMembers && item.sharedWithMembers.some((m) => m.id === selectedMemberId));
+
+    if (alreadyShared) {
+      Alert.alert('Already Shared', `"${item.name}" has already been shared with this team member.`);
+      return;
+    }
 
     const targetMember = teamMembers.find((m) => m.id === selectedMemberId);
     const ok = await shareItemWithMember(item.id, {
@@ -209,26 +224,32 @@ export const ShareModal: React.FC<ShareModalProps> = ({ visible, onClose, item }
                 </Text>
 
                 <View style={styles.memberList}>
-                  {teamMembers.map((member) => {
-                    const isSelected = selectedMemberId === member.id;
-                    return (
-                      <TouchableOpacity
-                        key={member.id}
-                        style={[styles.memberCard, isSelected && styles.memberCardSelected]}
-                        activeOpacity={0.7}
-                        onPress={() => {
-                          setSelectedMemberId(member.id);
-                          setSelectedMemberName(member.name);
-                        }}
-                      >
-                        <View>
-                          <Text style={styles.memberName}>{member.name}</Text>
-                          <Text style={styles.memberEmail}>{member.email}</Text>
-                        </View>
-                        {isSelected && <CheckIcon size={16} color={colors.cyan} />}
-                      </TouchableOpacity>
-                    );
-                  })}
+                  {teamMembers.length === 0 ? (
+                    <Text style={[styles.sectionDesc, { textAlign: 'center', paddingVertical: 14 }]}>
+                      No other members available in your organization to share with.
+                    </Text>
+                  ) : (
+                    teamMembers.map((member) => {
+                      const isSelected = selectedMemberId === member.id;
+                      return (
+                        <TouchableOpacity
+                          key={member.id}
+                          style={[styles.memberCard, isSelected && styles.memberCardSelected]}
+                          activeOpacity={0.7}
+                          onPress={() => {
+                            setSelectedMemberId(member.id);
+                            setSelectedMemberName(member.name);
+                          }}
+                        >
+                          <View>
+                            <Text style={styles.memberName}>{member.name}</Text>
+                            <Text style={styles.memberEmail}>{member.email}</Text>
+                          </View>
+                          {isSelected && <CheckIcon size={16} color={colors.cyan} />}
+                        </TouchableOpacity>
+                      );
+                    })
+                  )}
                 </View>
 
                 <TouchableOpacity

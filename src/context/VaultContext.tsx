@@ -344,8 +344,9 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
     const channelName = `vault_sync_${syncKey}_${Date.now()}`;
     const ownerFilter = `owner_id=eq.${currentUserId}`;
     const recipientFilter = `recipient_id=eq.${currentUserId}`;
+    const orgId = user?.organizationId;
 
-    const channel = supabase
+    let ch = supabase
       .channel(channelName)
       .on(
         'postgres_changes',
@@ -361,8 +362,23 @@ export const VaultProvider = ({ children }: { children: ReactNode }) => {
         'postgres_changes',
         { event: '*', schema: 'public', table: 'resource_shares', filter: recipientFilter },
         debouncedFetch
-      )
-      .subscribe();
+      );
+
+    if (appMode === 'organization' && orgId) {
+      ch = ch
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'resources', filter: `organization_id=eq.${orgId}` },
+          debouncedFetch
+        )
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'folders', filter: `organization_id=eq.${orgId}` },
+          debouncedFetch
+        );
+    }
+
+    const channel = ch.subscribe();
 
     return () => {
       if (syncTimeout) clearTimeout(syncTimeout);

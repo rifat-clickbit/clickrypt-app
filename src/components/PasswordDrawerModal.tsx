@@ -10,6 +10,7 @@ import {
   Switch,
   ActivityIndicator,
   Platform,
+  Alert,
 } from 'react-native';
 import { colors } from '../theme/colors';
 import {
@@ -152,7 +153,15 @@ export const PasswordDrawerModal: React.FC<PasswordDrawerModalProps> = ({
   const strength = evaluatePasswordStrength(password);
 
   const handleSubmit = async () => {
-    if (!name.trim()) return;
+    const cleanName = name.trim();
+    if (!cleanName) {
+      Alert.alert('Title Required', 'Please enter a title for this vault item.');
+      return;
+    }
+    if (cleanName.length > 100) {
+      Alert.alert('Title Too Long', 'Title must be 100 characters or less.');
+      return;
+    }
 
     // Validate Website URL for login passwords
     if (entryType === 'login') {
@@ -164,6 +173,37 @@ export const PasswordDrawerModal: React.FC<PasswordDrawerModalProps> = ({
         setUrlError('Please enter a valid website URL (e.g. github.com or https://example.com)');
         return;
       }
+      if (!editItem && !password.trim()) {
+        Alert.alert('Password Required', 'Please enter or generate a password for this credential.');
+        return;
+      }
+    }
+
+    // Validate Payment Cards
+    if (entryType === 'card') {
+      const cleanCardNum = cardNumber.replace(/\s+/g, '');
+      if (!cleanCardNum || !/^\d{13,19}$/.test(cleanCardNum)) {
+        Alert.alert('Invalid Card Number', 'Please enter a valid card number (13 to 19 digits).');
+        return;
+      }
+      const cleanExpiry = expiry.trim();
+      if (!cleanExpiry || !/^(0[1-9]|1[0-2])\/?([0-9]{2})$/.test(cleanExpiry)) {
+        Alert.alert('Invalid Expiry Date', 'Please enter expiration date in MM/YY format (e.g. 08/28).');
+        return;
+      }
+      const cleanCvv = cvv.trim();
+      if (!cleanCvv || !/^\d{3,4}$/.test(cleanCvv)) {
+        Alert.alert('Invalid Security Code', 'Please enter a valid 3 or 4 digit CVV / CVC.');
+        return;
+      }
+    }
+
+    // Validate Notes
+    if (entryType === 'note') {
+      if (noteContent && noteContent.length > 50000) {
+        Alert.alert('Note Exceeds Limit', 'Secure notes are limited to 50,000 characters maximum.');
+        return;
+      }
     }
 
     setLoading(true);
@@ -172,7 +212,7 @@ export const PasswordDrawerModal: React.FC<PasswordDrawerModalProps> = ({
     if (entryType === 'card') {
       secretValue = JSON.stringify({
         type: 'card',
-        holder: name.trim(),
+        holder: cleanName,
         cardNumber: cardNumber.replace(/\s+/g, ''),
         expiry: expiry.trim(),
         cvv: cvv.trim(),

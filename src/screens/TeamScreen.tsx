@@ -115,7 +115,7 @@ export const TeamScreen = () => {
       .on('postgres_changes', { event: '*', schema: 'public', table: 'group_folders' }, () => {
         fetchData(false);
       })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'team_members' }, () => {
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'organization_members' }, () => {
         fetchData(false);
       })
       .subscribe();
@@ -212,13 +212,29 @@ export const TeamScreen = () => {
       return;
     }
 
-    if (!inviteEmail.trim()) {
+    const cleanInviteEmail = inviteEmail.trim().toLowerCase();
+    if (!cleanInviteEmail) {
       Alert.alert('Email Required', 'Please enter work email address to invite.');
       return;
     }
 
+    const EMAIL_REGEX = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+    if (!EMAIL_REGEX.test(cleanInviteEmail)) {
+      Alert.alert('Invalid Email', 'Please enter a valid work email address (e.g. name@company.com).');
+      return;
+    }
+
+    if (user?.email && cleanInviteEmail === user.email.toLowerCase()) {
+      Alert.alert('Self Invitation', 'You cannot invite yourself to your own organization.');
+      return;
+    }
+
+    if (members.some((m) => m.email.toLowerCase() === cleanInviteEmail)) {
+      Alert.alert('Already Invited', `A member with email "${cleanInviteEmail}" is already in your organization roster.`);
+      return;
+    }
+
     const userDomain = user?.email && user.email.includes('@') ? user.email.split('@')[1].toLowerCase() : '';
-    const cleanInviteEmail = inviteEmail.trim().toLowerCase();
 
     if (userDomain && !cleanInviteEmail.endsWith('@' + userDomain)) {
       Alert.alert(
@@ -273,7 +289,7 @@ export const TeamScreen = () => {
         is_managed_account: true,
         status: 'invited',
         invited_by: user?.id,
-      });
+      }, { onConflict: 'organization_id,user_id' });
     } catch {
       // ignore
     }
@@ -297,12 +313,27 @@ export const TeamScreen = () => {
       return;
     }
 
-    if (!groupName.trim()) return;
+    const cleanGroupName = groupName.trim();
+    if (!cleanGroupName) {
+      Alert.alert('Group Name Required', 'Please enter a name for the group.');
+      return;
+    }
+
+    if (cleanGroupName.length > 50) {
+      Alert.alert('Invalid Group Name', 'Group name cannot exceed 50 characters.');
+      return;
+    }
+
+    if (groups.some((g) => g.name.trim().toLowerCase() === cleanGroupName.toLowerCase())) {
+      Alert.alert('Duplicate Group Name', `A group named "${cleanGroupName}" already exists in your organization.`);
+      return;
+    }
+
     const currentMemberIds = members.slice(0, 1).map((m) => m.id);
     const orgId = user?.organizationId || null;
     const newGroup: GroupItem = {
       id: `grp-${Date.now()}`,
-      name: groupName.trim(),
+      name: cleanGroupName,
       description: groupDesc.trim() || 'Organization custom user group',
       memberIds: currentMemberIds,
       folderIds: [],
@@ -367,6 +398,11 @@ export const TeamScreen = () => {
 
   // Add member to current group
   const handleAddMemberToGroup = async (memberId: string) => {
+    if (user?.role !== 'Owner' && user?.role !== 'Admin') {
+      Alert.alert('Permission Denied', 'Only Organization Owners and Admins can manage group members.');
+      return;
+    }
+
     if (!selectedGroup) return;
     const currentMemberIds = selectedGroup.memberIds || [];
     if (currentMemberIds.includes(memberId)) return;
@@ -398,6 +434,11 @@ export const TeamScreen = () => {
 
   // Remove member from current group
   const handleRemoveMemberFromGroup = async (memberId: string) => {
+    if (user?.role !== 'Owner' && user?.role !== 'Admin') {
+      Alert.alert('Permission Denied', 'Only Organization Owners and Admins can manage group members.');
+      return;
+    }
+
     if (!selectedGroup) return;
     const updatedMemberIds = (selectedGroup.memberIds || []).filter((id) => id !== memberId);
     const updatedGroup = {
@@ -421,6 +462,11 @@ export const TeamScreen = () => {
 
   // Assign folder to current group
   const handleAssignFolderToGroup = async (folderId: string) => {
+    if (user?.role !== 'Owner' && user?.role !== 'Admin') {
+      Alert.alert('Permission Denied', 'Only Organization Owners and Admins can manage group folders.');
+      return;
+    }
+
     if (!selectedGroup) return;
     const currentFolderIds = selectedGroup.folderIds || [];
     if (currentFolderIds.includes(folderId)) return;
@@ -451,6 +497,11 @@ export const TeamScreen = () => {
 
   // Unassign folder from current group
   const handleUnassignFolderFromGroup = async (folderId: string) => {
+    if (user?.role !== 'Owner' && user?.role !== 'Admin') {
+      Alert.alert('Permission Denied', 'Only Organization Owners and Admins can manage group folders.');
+      return;
+    }
+
     if (!selectedGroup) return;
     const updatedFolderIds = (selectedGroup.folderIds || []).filter((id) => id !== folderId);
     const updatedGroup = {

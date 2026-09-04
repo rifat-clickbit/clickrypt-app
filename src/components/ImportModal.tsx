@@ -40,20 +40,15 @@ export const ImportModal: React.FC<ImportModalProps> = ({ visible, onClose }) =>
 
       if (!result.canceled && result.assets && result.assets.length > 0) {
         const asset = result.assets[0];
-        setFileName(asset.name);
-
         const response = await fetch(asset.uri);
         const text = await response.text();
 
         const items = parsePasswordCsv(text);
-        if (items.length === 0) {
-          Alert.alert('Empty or Invalid CSV', 'No credentials could be parsed from this file.');
-          return;
-        }
+        setFileName(asset.name);
         setParsedItems(items);
       }
-    } catch {
-      Alert.alert('Error', 'Failed to read the selected file.');
+    } catch (err: any) {
+      Alert.alert('CSV Import Error', err?.message || 'Failed to read or parse the selected file.');
     }
   };
 
@@ -62,32 +57,37 @@ export const ImportModal: React.FC<ImportModalProps> = ({ visible, onClose }) =>
     setIsImporting(true);
     setProgress(0);
 
-    let successCount = 0;
-    for (let i = 0; i < parsedItems.length; i++) {
-      const item = parsedItems[i];
-      const ok = await createItem({
-        name: item.name,
-        username: item.username,
-        url: item.url,
-        password: item.password,
+    try {
+      let successCount = 0;
+      for (let i = 0; i < parsedItems.length; i++) {
+        const item = parsedItems[i];
+        const ok = await createItem({
+          name: item.name,
+          username: item.username,
+          url: item.url,
+          password: item.password,
+        });
+        if (ok) successCount++;
+        setProgress(i + 1);
+      }
+
+      await sendSecurityAlert({
+        title: 'Vault Import Complete',
+        body: `Successfully encrypted and imported ${successCount} passwords to your vault.`,
       });
-      if (ok) successCount++;
-      setProgress(i + 1);
+
+      Alert.alert(
+        'Import Complete',
+        `Successfully imported ${successCount} passwords into your encrypted vault.`
+      );
+      setFileName(null);
+      setParsedItems([]);
+      onClose();
+    } catch (err: any) {
+      Alert.alert('Import Failed', err?.message || 'An error occurred while importing passwords.');
+    } finally {
+      setIsImporting(false);
     }
-
-    setIsImporting(false);
-    await sendSecurityAlert({
-      title: 'Vault Import Complete',
-      body: `Successfully encrypted and imported ${successCount} passwords to your vault.`,
-    });
-
-    Alert.alert(
-      'Import Complete',
-      `Successfully imported ${successCount} passwords into your encrypted vault.`
-    );
-    setFileName(null);
-    setParsedItems([]);
-    onClose();
   };
 
   return (

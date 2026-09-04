@@ -60,7 +60,9 @@ export const AuthScreen = () => {
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
 
   // 2FA Login Step State
@@ -121,12 +123,14 @@ export const AuthScreen = () => {
       return;
     }
 
+    const EMAIL_REGEX = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+    if (!EMAIL_REGEX.test(cleanEmail)) {
+      setErrorMsg('Please enter a valid email address (e.g. name@company.com).');
+      return;
+    }
+
     // Validation: If Organization Mode, require professional email with custom domain
     if (selectedMode === 'organization') {
-      if (!cleanEmail.includes('@') || !cleanEmail.includes('.')) {
-        setErrorMsg('Please enter a valid company work email.');
-        return;
-      }
       const domain = getDomain(cleanEmail);
       if (FREE_EMAIL_DOMAINS.includes(domain)) {
         setErrorMsg(
@@ -142,15 +146,27 @@ export const AuthScreen = () => {
     await setAppMode(selectedMode);
 
     if (isRegister) {
-      if (!name.trim()) {
-        setErrorMsg('Please enter your full name.');
+      const cleanName = name.trim();
+      if (!cleanName || cleanName.length < 2 || cleanName.length > 60) {
+        setErrorMsg('Full Name must be between 2 and 60 characters.');
         return;
       }
-      if (password.trim().length < 8) {
-        setErrorMsg('Master Password must be at least 8 characters long.');
+      if (password !== confirmPassword) {
+        setErrorMsg('Master Passwords do not match. Please re-enter.');
         return;
       }
-      const res = await register(name, cleanEmail, password);
+      if (password.length < 10) {
+        setErrorMsg('Master Password must be at least 10 characters long.');
+        return;
+      }
+      const hasUpper = /[A-Z]/.test(password);
+      const hasLower = /[a-z]/.test(password);
+      const hasNumOrSym = /[0-9!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]/.test(password);
+      if (!hasUpper || !hasLower || !hasNumOrSym) {
+        setErrorMsg('Master Password must include uppercase, lowercase, and a number or symbol.');
+        return;
+      }
+      const res = await register(cleanName, cleanEmail, password);
       if (!res.success) setErrorMsg(res.error || 'Registration failed');
     } else {
       // Check if account has 2FA enabled
@@ -170,8 +186,8 @@ export const AuthScreen = () => {
   const handleVerify2FASubmit = async () => {
     setErrorMsg('');
     const cleanCode = totpCode.trim();
-    if (!cleanCode) {
-      setErrorMsg('Please enter the 6-digit 2FA code.');
+    if (!cleanCode || !/^\d{6}$/.test(cleanCode)) {
+      setErrorMsg('Please enter a valid 6-digit numeric 2FA code.');
       return;
     }
 
@@ -467,6 +483,36 @@ export const AuthScreen = () => {
                 </View>
               </View>
 
+              {isRegister && (
+                <View style={styles.field}>
+                  <Text style={styles.label}>Confirm Master Password</Text>
+                  <View style={styles.passwordInputContainer}>
+                    <TextInput
+                      style={styles.passwordInput}
+                      placeholder="Re-enter master password"
+                      placeholderTextColor={colors.textMuted}
+                      value={confirmPassword}
+                      onChangeText={setConfirmPassword}
+                      autoCapitalize="none"
+                      autoCorrect={false}
+                      spellCheck={false}
+                      secureTextEntry={!showConfirmPassword}
+                    />
+                    <TouchableOpacity
+                      style={styles.eyeToggleBtn}
+                      onPress={() => setShowConfirmPassword(!showConfirmPassword)}
+                      activeOpacity={0.7}
+                    >
+                      {showConfirmPassword ? (
+                        <EyeOffIcon size={16} color={colors.cyan} />
+                      ) : (
+                        <EyeIcon size={16} color={colors.textMuted} />
+                      )}
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              )}
+
               <TouchableOpacity
                 style={styles.submitBtn}
                 activeOpacity={0.8}
@@ -490,6 +536,7 @@ export const AuthScreen = () => {
                 onPress={() => {
                   setIsRegister(!isRegister);
                   setErrorMsg('');
+                  setConfirmPassword('');
                 }}
               >
                 <Text style={styles.toggleText}>

@@ -38,14 +38,59 @@ function parseCsvLine(line: string): string[] {
 }
 
 /**
+ * Strip formula injection characters and surrounding quotes
+ */
+function sanitizeCsvValue(val: string): string {
+  if (!val) return '';
+  let clean = val.replace(/^"(.*)"$/, '$1').trim();
+  // Strip leading formula execution characters (=, +, -, @, \t, \r) to prevent CSV Injection
+  clean = clean.replace(/^[=+\-@\t\r]+/, '');
+  return clean;
+}
+
+/**
  * Universal CSV importer supporting Bitwarden, 1Password, LastPass, Google Chrome, and generic formats
  */
 export function parsePasswordCsv(csvContent: string): ParsedCsvItem[] {
-  if (!csvContent) return [];
+  if (!csvContent || !csvContent.trim()) {
+    throw new Error('CSV file is empty.');
+  }
+
   const lines = csvContent.split(/\r?\n/).filter((l) => l.trim().length > 0);
-  if (lines.length < 2) return [];
+  if (lines.length < 2) {
+    throw new Error('CSV file must contain a header row and at least one data row.');
+  }
+
+  if (lines.length - 1 > 1000) {
+    throw new Error('CSV file exceeds the maximum limit of 1,000 items per import batch. Please split your file.');
+  }
 
   const headers = parseCsvLine(lines[0]).map((h) => h.toLowerCase().replace(/[^a-z0-9_]/g, ''));
+
+  // Validate that the CSV has recognized credential headers
+  const recognizedHeaderKeywords = [
+    'name',
+    'title',
+    'item_name',
+    'password',
+    'login_password',
+    'secret',
+    'username',
+    'login_username',
+    'user',
+    'email',
+    'url',
+    'website',
+    'login_uri',
+  ];
+
+  const hasRecognizedHeader = headers.some((h) => recognizedHeaderKeywords.includes(h));
+  if (!hasRecognizedHeader) {
+    throw new Error(
+      'Unrecognized CSV format. The file must contain standard credential headers (e.g. name, title, username, password, url).'
+    );
+  }
+
   const items: ParsedCsvItem[] = [];
 
   // Identify column indices
@@ -68,25 +113,36 @@ export function parsePasswordCsv(csvContent: string): ParsedCsvItem[] {
 
   for (let i = 1; i < lines.length; i++) {
     const cols = parseCsvLine(lines[i]);
-    if (cols.length <= 1) continue;
+    if (cols.length <= 1 && !cols[0]) continue;
 
-    const name = (nameIdx !== -1 && cols[nameIdx]) || cols[0] || 'Imported Password';
-    const username = (userIdx !== -1 && cols[userIdx]) || '';
-    const password = (passIdx !== -1 && cols[passIdx]) || '';
-    const url = (urlIdx !== -1 && cols[urlIdx]) || '';
-    const folder = folderIdx !== -1 ? cols[folderIdx] : undefined;
-    const notes = notesIdx !== -1 ? cols[notesIdx] : undefined;
+    const rawName = (nameIdx !== -1 && cols[nameIdx]) || cols[0] || '';
+    const rawUser = (userIdx !== -1 && cols[userIdx]) || '';
+    const rawPass = (passIdx !== -1 && cols[passIdx]) || '';
+    const rawUrl = (urlIdx !== -1 && cols[urlIdx]) || '';
+    const rawFolder = folderIdx !== -1 ? cols[folderIdx] : undefined;
+    const rawNotes = notesIdx !== -1 ? cols[notesIdx] : undefined;
+
+    const name = sanitizeCsvValue(rawName).slice(0, 100);
+    const username = sanitizeCsvValue(rawUser).slice(0, 255);
+    const password = sanitizeCsvValue(rawPass).slice(0, 1000);
+    const url = sanitizeCsvValue(rawUrl).slice(0, 2048);
+    const folder = rawFolder ? sanitizeCsvValue(rawFolder).slice(0, 50) : undefined;
+    const notes = rawNotes ? sanitizeCsvValue(rawNotes).slice(0, 50000) : undefined;
 
     if (name || password || username) {
       items.push({
-        name: name.replace(/^"(.*)"$/, '$1'),
-        username: username.replace(/^"(.*)"$/, '$1'),
-        url: url.replace(/^"(.*)"$/, '$1'),
-        password: password.replace(/^"(.*)"$/, '$1'),
-        folder: folder ? folder.replace(/^"(.*)"$/, '$1') : undefined,
-        notes: notes ? notes.replace(/^"(.*)"$/, '$1') : undefined,
+        name: name || 'Imported Password',
+        username,
+        url,
+        password,
+        folder,
+        notes,
       });
     }
+  }
+
+  if (items.length === 0) {
+    throw new Error('No valid credential records could be found in this CSV file.');
   }
 
   return items;

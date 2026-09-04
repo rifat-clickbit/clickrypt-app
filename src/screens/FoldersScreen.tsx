@@ -48,35 +48,52 @@ export const FoldersScreen = () => {
   const [shareItem, setShareItem] = useState<VaultItem | null>(null);
 
   const handleCreateFolder = async () => {
-    if (!newFolderName.trim()) return;
+    const cleanName = newFolderName.trim();
+    if (!cleanName) {
+      Alert.alert('Folder Name Required', 'Please enter a name for the folder.');
+      return;
+    }
+    if (cleanName.length > 50) {
+      Alert.alert('Name Too Long', 'Folder name must be 50 characters or less.');
+      return;
+    }
+    if (folders.some((f) => f.name.toLowerCase() === cleanName.toLowerCase())) {
+      Alert.alert('Duplicate Folder', `A folder named "${cleanName}" already exists in your vault.`);
+      return;
+    }
     if (!user) return;
-    const newFolder: FolderItem = {
-      id: `fld-${Date.now()}`,
-      name: newFolderName.trim(),
-      itemCount: 0,
-      lastModified: new Date().toLocaleDateString('en-US', {
-        month: 'short',
-        day: 'numeric',
-        year: 'numeric',
-      }),
-      mode: appMode,
-      color: '#FBBF24',
-    };
 
-    await supabase.from('folders').upsert({
-      id: newFolder.id,
-      name: newFolder.name,
-      description: newFolder.description || 'Custom folder',
-      color: newFolder.color || '#FBBF24',
-      mode: appMode,
-      owner_id: user.id,
-      organization_id: user.organizationId || null,
-      data: newFolder,
-    });
+    try {
+      const newFolder: FolderItem = {
+        id: `fld-${Date.now()}`,
+        name: cleanName,
+        itemCount: 0,
+        lastModified: new Date().toLocaleDateString('en-US', {
+          month: 'short',
+          day: 'numeric',
+          year: 'numeric',
+        }),
+        mode: appMode,
+        color: '#FBBF24',
+      };
 
-    setNewFolderName('');
-    setModalVisible(false);
-    await refreshVault();
+      await supabase.from('folders').upsert({
+        id: newFolder.id,
+        name: newFolder.name,
+        description: newFolder.description || 'Custom folder',
+        color: newFolder.color || '#FBBF24',
+        mode: appMode,
+        owner_id: user.id,
+        organization_id: user.organizationId || null,
+        data: newFolder,
+      });
+
+      setNewFolderName('');
+      setModalVisible(false);
+      await refreshVault();
+    } catch {
+      Alert.alert('Error', 'Failed to create folder. Please try again.');
+    }
   };
 
   const handleDeleteFolder = (folder: FolderItem) => {

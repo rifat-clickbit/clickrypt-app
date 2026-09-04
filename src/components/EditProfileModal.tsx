@@ -117,31 +117,19 @@ export const EditProfileModal: React.FC<EditProfileModalProps> = ({ visible, onC
   const handleSave = async () => {
     setErrorMsg('');
     const cleanName = name.trim();
-    const cleanEmail = email.trim().toLowerCase();
 
     if (!cleanName) {
       setErrorMsg('Please enter your full name.');
       return;
     }
 
-    if (!cleanEmail || !cleanEmail.includes('@') || !cleanEmail.includes('.')) {
-      setErrorMsg('Please enter a valid email address.');
+    if (cleanName.length < 2 || cleanName.length > 60) {
+      setErrorMsg('Full name must be between 2 and 60 characters.');
       return;
     }
 
-    // Mode-specific email validation
-    if (appMode === 'organization') {
-      const domain = getDomain(cleanEmail);
-      if (FREE_EMAIL_DOMAINS.includes(domain)) {
-        setErrorMsg(
-          `Organization Vault requires a company work email (e.g. name@company.com). Free domains like @${domain} are not allowed.`
-        );
-        return;
-      }
-    }
-
     setIsSaving(true);
-    const res = await updateProfile(cleanName, cleanEmail, avatarUri || undefined);
+    const res = await updateProfile(cleanName, user?.email || email, avatarUri || undefined);
     setIsSaving(false);
 
     if (res.success) {
@@ -240,56 +228,29 @@ export const EditProfileModal: React.FC<EditProfileModalProps> = ({ visible, onC
               />
             </View>
 
-            {/* Email Address Input (Editable with Mode Validation) */}
+            {/* Email Address Input (Read-only bound to cryptographic keys) */}
             <View style={styles.field}>
               <View style={styles.fieldLabelRow}>
                 <Text style={styles.label}>
                   {appMode === 'organization' ? 'Company Work Email' : 'Email Address'}
                 </Text>
-                {appMode === 'organization' && (
-                  <Text style={styles.domainReqTag}>Work domain required</Text>
-                )}
+                <View style={styles.lockedBadge}>
+                  <LucideKeyRound size={11} color={colors.textMuted} />
+                  <Text style={styles.lockedBadgeText}>Cryptographically Locked</Text>
+                </View>
               </View>
               <TextInput
-                style={[
-                  styles.input,
-                  appMode === 'organization' && detectedDomain && isFreeDomain && styles.inputError,
-                ]}
+                style={[styles.input, styles.inputDisabled]}
                 placeholder={
                   appMode === 'organization' ? 'work@company.com' : 'Enter email address'
                 }
                 placeholderTextColor={colors.textMuted}
                 value={email}
-                onChangeText={(val) => {
-                  setEmail(val);
-                  setErrorMsg('');
-                }}
-                keyboardType="email-address"
-                autoCapitalize="none"
-                autoComplete="off"
-                autoCorrect={false}
-                textContentType="none"
-                importantForAutofill="no"
+                editable={false}
               />
-
-              {/* Domain Detection Feedback Pill */}
-              {appMode === 'organization' && detectedDomain ? (
-                isFreeDomain ? (
-                  <View style={styles.domainErrorRow}>
-                    <AlertWarningIcon size={12} color={colors.danger} />
-                    <Text style={styles.domainErrorText}>
-                      Free domains (@{detectedDomain}) are not permitted in Organization Mode. Please use your corporate email.
-                    </Text>
-                  </View>
-                ) : (
-                  <View style={styles.domainSuccessPill}>
-                    <LucideBuilding size={12} color={colors.cyan} strokeWidth={2} />
-                    <Text style={styles.domainSuccessText}>
-                      Corporate Domain: {detectedDomain}
-                    </Text>
-                  </View>
-                )
-              ) : null}
+              <Text style={styles.cryptoNoteText}>
+                Your email address is cryptographically bound to your Zero-Knowledge OpenPGP key pair.
+              </Text>
             </View>
 
             {/* Actions */}
@@ -500,9 +461,33 @@ const createStyles = (colors: any) =>
     color: colors.text,
     fontSize: 13.5,
   },
-  inputError: {
-    borderColor: colors.danger,
-    backgroundColor: colors.dangerBg,
+  inputDisabled: {
+    opacity: 0.7,
+    backgroundColor: colors.surface2,
+    borderColor: colors.border,
+    color: colors.textSecondary,
+  },
+  lockedBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: colors.surface2,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  lockedBadgeText: {
+    fontSize: 9.5,
+    color: colors.textMuted,
+    fontWeight: '600',
+  },
+  cryptoNoteText: {
+    fontSize: 11,
+    color: colors.textMuted,
+    marginTop: 2,
+    lineHeight: 15,
   },
   domainErrorRow: {
     flexDirection: 'row',

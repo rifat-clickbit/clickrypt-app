@@ -113,7 +113,23 @@ serve(async (req) => {
       }
     }
 
-    const allTargetUserIds = Array.from(new Set(deletedUserIds));
+    const SAFE_ID_REGEX = /^[a-zA-Z0-9_\-\.]+$/;
+    const allTargetUserIds = Array.from(new Set(deletedUserIds)).filter(
+      (id) => typeof id === 'string' && SAFE_ID_REGEX.test(id)
+    );
+    const safeOrgIds = Array.from(new Set(deletedOrganizationIds)).filter(
+      (id) => typeof id === 'string' && SAFE_ID_REGEX.test(id)
+    );
+    const safeAuthIds = Array.from(new Set(deletedAuthIds)).filter(
+      (id) => typeof id === 'string' && SAFE_ID_REGEX.test(id)
+    );
+
+    if (allTargetUserIds.length === 0) {
+      return new Response(
+        JSON.stringify({ success: false, error: 'No valid user targets identified for deletion' }),
+        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
 
     // 4. CASCADE DELETION SEQUENCE:
     // Step 4.1: Delete Resource Shares
@@ -124,13 +140,16 @@ serve(async (req) => {
     completedSteps.push('RESOURCE_SHARES');
 
     // Step 4.2: Delete Group Folders & Group Members & Groups
-    if (deletedOrganizationIds.length > 0) {
+    if (safeOrgIds.length > 0) {
       const { data: orgGroups } = await adminClient
         .from('groups')
         .select('id')
-        .in('organization_id', deletedOrganizationIds);
+        .in('organization_id', safeOrgIds);
       
-      const groupIds = (orgGroups || []).map((g: any) => g.id);
+      const groupIds = (orgGroups || [])
+        .map((g: any) => g.id)
+        .filter((id: string) => typeof id === 'string' && SAFE_ID_REGEX.test(id));
+
       if (groupIds.length > 0) {
         await adminClient.from('group_folders').delete().in('group_id', groupIds);
         await adminClient.from('group_members').delete().in('group_id', groupIds);
@@ -142,23 +161,30 @@ serve(async (req) => {
       .delete()
       .in('user_id', allTargetUserIds);
 
-    await adminClient
-      .from('groups')
-      .delete()
-      .or(`created_by.in.(${allTargetUserIds.join(',')}),owner_id.in.(${allTargetUserIds.join(',')})`);
+    try {
+      await adminClient
+        .from('groups')
+        .delete()
+        .or(`created_by.in.(${allTargetUserIds.join(',')}),owner_id.in.(${allTargetUserIds.join(',')})`);
+    } catch {
+      await adminClient
+        .from('groups')
+        .delete()
+        .in('created_by', allTargetUserIds);
+    }
     completedSteps.push('GROUPS');
 
     // Step 4.3: Delete Resources & Folders
-    if (deletedOrganizationIds.length > 0) {
+    if (safeOrgIds.length > 0) {
       await adminClient
         .from('resources')
         .delete()
-        .or(`owner_id.in.(${allTargetUserIds.join(',')}),organization_id.in.(${deletedOrganizationIds.join(',')})`);
+        .or(`owner_id.in.(${allTargetUserIds.join(',')}),organization_id.in.(${safeOrgIds.join(',')})`);
 
       await adminClient
         .from('folders')
         .delete()
-        .or(`owner_id.in.(${allTargetUserIds.join(',')}),organization_id.in.(${deletedOrganizationIds.join(',')})`);
+        .or(`owner_id.in.(${allTargetUserIds.join(',')}),organization_id.in.(${safeOrgIds.join(',')})`);
     } else {
       await adminClient.from('resources').delete().in('owner_id', allTargetUserIds);
       await adminClient.from('folders').delete().in('owner_id', allTargetUserIds);
@@ -173,16 +199,16 @@ serve(async (req) => {
     completedSteps.push('ACTIVITY_LOGS');
 
     // Step 4.5: Delete Organization Memberships & Organizations
-    if (deletedOrganizationIds.length > 0) {
+    if (safeOrgIds.length > 0) {
       await adminClient
         .from('organization_members')
         .delete()
-        .in('organization_id', deletedOrganizationIds);
+        .in('organization_id', safeOrgIds);
 
       await adminClient
         .from('organizations')
         .delete()
-        .in('id', deletedOrganizationIds);
+        .in('id', safeOrgIds);
       completedSteps.push('ORGANIZATIONS');
     }
 
@@ -194,7 +220,7 @@ serve(async (req) => {
     completedSteps.push('PUBLIC_USERS');
 
     // Step 4.7: Delete Supabase Auth Users (Members first, Owner last)
-    for (const authId of deletedAuthIds) {
+    for (const authId of safeAuthIds) {
       try {
         await adminClient.auth.admin.deleteUser(authId);
       } catch (err) {
@@ -207,7 +233,7 @@ serve(async (req) => {
       JSON.stringify({
         success: true,
         deletionType,
-        deletedOrganizationIds,
+        deletedOrganizationIds: safeOrgIds,
         deletedUserIds: allTargetUserIds,
         completedSteps,
       }),
